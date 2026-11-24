@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"code-runner/execution-engine/internal/api"
 	"code-runner/shared/dto"
+	"code-runner/shared/models"
 	"code-runner/shared/response"
 )
 
@@ -132,5 +136,53 @@ func TestAPI_Submit_And_Status(t *testing.T) {
 
 	if statusResp.StatusCode != 200 {
 		t.Fatalf("expected status 200, got %d", statusResp.StatusCode)
+	}
+}
+
+func TestAPI_Status_IDOR_Protection(t *testing.T) {
+	mock := newMockQueueStore()
+	h := api.NewHandler(mock, mock)
+
+	// User A owns this job
+	ownerUUID := uuid.New()
+	jobA := &dto.Job{
+		ID:        "job-user-a",
+		UserID:    ownerUUID.String(),
+		Language:  "python",
+		Code:      "secret_api_token = 'SUPER_SECRET_123'",
+		Status:    dto.StatusCompleted,
+		CreatedAt: time.Now(),
+	}
+	_ = mock.Enqueue(context.Background(), jobA)
+
+	app := fiber.New()
+	// Middleware injecting User B (attacker) auth metadata
+	attackerUUID := uuid.New()
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals("auth", &models.APIKeyCachedMetadata{
+			UserID:   attackerUUID,
+			Plan:     models.PlanPro,
+			IsActive: true,
+		})
+		return c.Next()
+	})
+	app.Get("/v1/status/:id", h.Status)
+
+	// Attacker tries to query User A's job
+	req := httptest.NewRequest("GET", "/v1/status/job-user-a", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Must be blocked with 403 Forbidden!
+	if resp.StatusCode != fiber.StatusForbidden {
+		t.Fatalf("SECURITY VULNERABILITY: expected status 403 Forbidden on cross-tenant job access, got %d", resp.StatusCode)
+	}
+
+	// Verify Cache-Control header is private
+	cacheControl := resp.Header.Get("Cache-Control")
+	if strings.Contains(cacheControl, "public") {
+		t.Errorf("SECURITY VULNERABILITY: Cache-Control should be private, got %s", cacheControl)
 	}
 }

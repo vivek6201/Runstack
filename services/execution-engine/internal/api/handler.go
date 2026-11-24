@@ -103,13 +103,18 @@ func (h *Handler) Status(c *fiber.Ctx) error {
 		return response.NotFound(c, "job not found or expired")
 	}
 
-	// Dynamic caching header:
-	// Once execution is completed or failed, the result is immutable.
-	if job.Status == dto.StatusCompleted || job.Status == dto.StatusFailed {
-		c.Set("Cache-Control", "public, max-age=60, immutable")
-	} else {
-		c.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	// IDOR check: If the job belongs to a registered user, ensure requesting caller owns it
+	if job.UserID != "" {
+		if authMeta, ok := c.Locals("auth").(*models.APIKeyCachedMetadata); ok && authMeta != nil {
+			if authMeta.UserID == uuid.Nil || job.UserID != authMeta.UserID.String() {
+				return response.Forbidden(c, "access denied: you do not have permission to view this job")
+			}
+		}
 	}
+
+	// Never use public cache-control for user execution code and results:
+	// Use private, no-cache so shared CDNs and reverse proxies never store customer code/results.
+	c.Set("Cache-Control", "private, no-cache, no-store, must-revalidate")
 
 	return response.Success(c, job)
 }

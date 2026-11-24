@@ -37,28 +37,30 @@ func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.P
 		name = "Default API Key"
 	}
 
+	// 1. Determine default & maximum allowances by plan tier to prevent privilege escalation
+	var defaultRPM, maxRPM int
+	var defaultConcurrency, maxConcurrency int
+
+	switch plan {
+	case models.PlanEnterprise:
+		defaultRPM, maxRPM = 1200, 2400
+		defaultConcurrency, maxConcurrency = 50, 100
+	case models.PlanPro:
+		defaultRPM, maxRPM = 300, 600
+		defaultConcurrency, maxConcurrency = 10, 20
+	default: // Free
+		defaultRPM, maxRPM = 60, 60
+		defaultConcurrency, maxConcurrency = 2, 2
+	}
+
 	rpm := req.RateLimitRPM
-	if rpm <= 0 {
-		switch plan {
-		case models.PlanPro:
-			rpm = 300
-		case models.PlanEnterprise:
-			rpm = 1200
-		default:
-			rpm = 60
-		}
+	if rpm <= 0 || rpm > maxRPM {
+		rpm = defaultRPM
 	}
 
 	concurrency := req.MaxConcurrency
-	if concurrency <= 0 {
-		switch plan {
-		case models.PlanPro:
-			concurrency = 10
-		case models.PlanEnterprise:
-			concurrency = 50
-		default:
-			concurrency = 2
-		}
+	if concurrency <= 0 || concurrency > maxConcurrency {
+		concurrency = defaultConcurrency
 	}
 
 	rawKey, prefix, hash, err := crypto.GenerateAPIKey("live")
@@ -81,7 +83,9 @@ func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.P
 		return nil, fmt.Errorf("failed to save api key: %w", err)
 	}
 
-	// Cache in Redis for sub-millisecond execution engine lookup
+	// Cache in Redis for sub-millisecond execution engine lookup.
+	// We store without TTL (0) so keys do not expire unexpectedly after 24h.
+	// Key invalidation is explicitly handled via s.cache.Revoke on key revocation.
 	if s.cache != nil {
 		metadata := models.APIKeyCachedMetadata{
 			APIKeyID:       apiKey.ID,
@@ -91,7 +95,7 @@ func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.P
 			MaxConcurrency: apiKey.MaxConcurrency,
 			IsActive:       true,
 		}
-		_ = s.cache.Set(ctx, cache.Key("apikey", "cache", hash), metadata, 24*time.Hour)
+		_ = s.cache.Set(ctx, cache.Key("apikey", "cache", hash), metadata, 0)
 		_ = s.cache.Revoke(ctx, cache.Key("dashboard", "keys", userID.String()))
 	}
 
