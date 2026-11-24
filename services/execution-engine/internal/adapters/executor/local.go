@@ -7,15 +7,35 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"code-runner/shared/dto"
 )
 
 const (
-	maxOutputBytes = 256 * 1024         // 256 KB max stdout/stderr cap
-	compileTimeout = 15 * time.Second   // Max 15s for compilation
+	maxOutputBytes = 256 * 1024       // 256 KB max stdout/stderr cap
+	compileTimeout = 15 * time.Second // Max 15s for compilation
 )
+
+// getSanitizedEnv returns a minimal, isolated environment for child processes,
+// preventing user code from inspecting host secrets, database URLs, or Redis credentials.
+func getSanitizedEnv(workingDir string) []string {
+	path := os.Getenv("PATH")
+	if path == "" {
+		path = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+	}
+	return []string{
+		"PATH=" + path,
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+		"HOME=" + workingDir,
+		"TMPDIR=" + workingDir,
+		"PYTHONUNBUFFERED=1",
+		"PYTHONDONTWRITEBYTECODE=1",
+		"NODE_ENV=production",
+	}
+}
 
 // LocalSubprocessAdapter executes code locally inside an isolated temporary directory.
 // For compiled languages (C, C++, Go, Java), it compiles ONCE and executes the resulting
@@ -65,27 +85,47 @@ func (a *LocalSubprocessAdapter) Execute(ctx context.Context, job *dto.Job) (*dt
 		compileCtx, cancel := context.WithTimeout(ctx, compileTimeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(compileCtx, cfg.compileCmd, cfg.compileArgs...)
+		cmd := exec.Command(cfg.compileCmd, cfg.compileArgs...)
 		cmd.Dir = tempDir
+		cmd.Env = getSanitizedEnv(tempDir)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		var compileStderr, compileStdout strings.Builder
 		cmd.Stderr = &compileStderr
 		cmd.Stdout = &compileStdout
 
 		compileStart := time.Now()
-		err := cmd.Run()
-		compileDuration := time.Since(compileStart).Milliseconds()
-		result.CompilationTimeMs = compileDuration
+		if err := cmd.Start(); err != nil {
+			result.ExitCode = 1
+			result.Stderr = capOutput(fmt.Sprintf("Failed to start compiler: %v", err))
+			return result, nil
+		}
 
-		if err != nil {
+		compileDone := make(chan error, 1)
+		go func() {
+			compileDone <- cmd.Wait()
+		}()
+
+		var compileErr error
+		select {
+		case <-compileCtx.Done():
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			<-compileDone
+			result.CompilationTimeMs = time.Since(compileStart).Milliseconds()
+			result.ExitCode = 1
+			result.Stderr = capOutput("Compilation Error:\nCompilation Timed Out (exceeded 15s limit)\n" + compileStderr.String())
+			return result, nil
+		case compileErr = <-compileDone:
+			result.CompilationTimeMs = time.Since(compileStart).Milliseconds()
+		}
+
+		if compileErr != nil {
 			errOutput := compileStderr.String()
 			if errOutput == "" {
 				errOutput = compileStdout.String()
 			}
-			if compileCtx.Err() == context.DeadlineExceeded {
-				errOutput = "Compilation Timed Out (exceeded 15s limit)\n" + errOutput
-			}
-
 			// Compilation failed: skip all test cases and return immediately!
 			result.ExitCode = 1
 			result.Stderr = capOutput("Compilation Error:\n" + errOutput)
@@ -216,13 +256,6 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 			runArgs: []string{"run", filepath.Join(tempDir, "solution.ts")},
 		}, nil
 
-	case "bash", "sh":
-		return &langConfig{
-			srcFile: "solution.sh",
-			runCmd:  "bash",
-			runArgs: []string{filepath.Join(tempDir, "solution.sh")},
-		}, nil
-
 	default:
 		return nil, fmt.Errorf("unsupported language: %s", language)
 	}
@@ -232,8 +265,10 @@ func runSingleTestCase(ctx context.Context, workingDir, cmdName string, args []s
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, cmdName, args...)
+	cmd := exec.Command(cmdName, args...)
 	cmd.Dir = workingDir
+	cmd.Env = getSanitizedEnv(workingDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if stdinInput != "" {
 		cmd.Stdin = strings.NewReader(stdinInput)
@@ -244,23 +279,39 @@ func runSingleTestCase(ctx context.Context, workingDir, cmdName string, args []s
 	cmd.Stderr = &stderrBuf
 
 	start := time.Now()
-	err := cmd.Run()
-	duration := time.Since(start).Milliseconds()
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start execution process: %w", err)
+	}
 
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	var waitErr error
+	select {
+	case <-execCtx.Done():
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-waitDone
+		duration := time.Since(start).Milliseconds()
+		return &dto.ExecutionResult{
+			Stdout:      capOutput(stdoutBuf.String()),
+			Stderr:      "Time Limit Exceeded\n" + capOutput(stderrBuf.String()),
+			ExitCode:    124,
+			TimeTakenMs: duration,
+		}, nil
+	case waitErr = <-waitDone:
+	}
+
+	duration := time.Since(start).Milliseconds()
 	stdoutStr := capOutput(stdoutBuf.String())
 	stderrStr := capOutput(stderrBuf.String())
 
 	exitCode := 0
-	if err != nil {
-		if execCtx.Err() == context.DeadlineExceeded {
-			return &dto.ExecutionResult{
-				Stdout:      stdoutStr,
-				Stderr:      "Time Limit Exceeded\n" + stderrStr,
-				ExitCode:    124,
-				TimeTakenMs: duration,
-			}, nil
-		}
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = 1

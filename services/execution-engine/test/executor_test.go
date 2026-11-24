@@ -242,3 +242,58 @@ func TestLocalExecutor_Timeout(t *testing.T) {
 		t.Errorf("expected exit code 124 for timeout, got %d", res.ExitCode)
 	}
 }
+
+func TestLocalExecutor_Security_EnvironmentSanitization(t *testing.T) {
+	adapter := executor.NewLocalSubprocessAdapter()
+
+	// Simulate sensitive host secrets
+	t.Setenv("REDIS_PASSWORD", "super_secret_redis_pass_12345")
+	t.Setenv("DATABASE_URL", "postgres://admin:secret@db:5432/coderunner")
+	t.Setenv("JWT_SECRET", "super_secret_jwt_key_should_never_leak")
+
+	job := &dto.Job{
+		ID:          "test-env-leak",
+		Language:    "python",
+		Code:        "import os\nprint(os.environ.get('REDIS_PASSWORD', 'NONE'))\nprint(os.environ.get('DATABASE_URL', 'NONE'))\nprint(os.environ.get('JWT_SECRET', 'NONE'))",
+		TimeLimitMs: 3000,
+	}
+
+	res, err := adapter.Execute(context.Background(), job)
+	if err != nil {
+		t.Fatalf("execution error: %v", err)
+	}
+
+	if res.ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d (stderr: %s)", res.ExitCode, res.Stderr)
+	}
+
+	if strings.Contains(res.Stdout, "super_secret_redis_pass_12345") {
+		t.Errorf("SECURITY VULNERABILITY: REDIS_PASSWORD was leaked to user code!")
+	}
+	if strings.Contains(res.Stdout, "secret@db") {
+		t.Errorf("SECURITY VULNERABILITY: DATABASE_URL was leaked to user code!")
+	}
+	if strings.Contains(res.Stdout, "super_secret_jwt_key") {
+		t.Errorf("SECURITY VULNERABILITY: JWT_SECRET was leaked to user code!")
+	}
+}
+
+func TestLocalExecutor_Security_DirectBashDisallowed(t *testing.T) {
+	adapter := executor.NewLocalSubprocessAdapter()
+
+	job := &dto.Job{
+		ID:          "test-bash-exploit",
+		Language:    "bash",
+		Code:        "echo 'exploit'",
+		TimeLimitMs: 1000,
+	}
+
+	_, err := adapter.Execute(context.Background(), job)
+	if err == nil {
+		t.Fatalf("SECURITY VULNERABILITY: direct bash execution should be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "unsupported language") {
+		t.Errorf("expected unsupported language error, got: %v", err)
+	}
+}
