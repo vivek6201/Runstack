@@ -1,19 +1,69 @@
-import { Button } from "@workspace/ui/components/button"
+import { useState, useEffect } from "react"
+import { Navbar } from "./components/Navbar"
+import { Playground } from "./components/Playground"
+import { ApiKeys } from "./components/ApiKeys"
+import { Submissions } from "./components/Submissions"
+import { Analytics } from "./components/Analytics"
+import { Quickstart } from "./components/Quickstart"
+import { AuthModal } from "./components/AuthModal"
+import type { User } from "./types"
+import { api } from "./lib/api"
 
 export function App() {
+  const [activeTab, setActiveTab] = useState("playground")
+  const [user, setUser] = useState<User | null>(null)
+  const [authModalOpen, setAuthModalOpen] = useState(false)
+
+  // Verify authenticated session on load
+  useEffect(() => {
+    api
+      .getMe()
+      .then((u) => setUser(u))
+      .catch(() => {
+        // Not logged in or expired session
+        setUser(null)
+      })
+  }, [])
+
+  const handleLogout = async () => {
+    await api.logout()
+    setUser(null)
+  }
+
   return (
-    <div className="flex min-h-svh p-6">
-      <div className="flex max-w-md min-w-0 flex-col gap-4 text-sm leading-loose">
-        <div>
-          <h1 className="font-medium">Project ready!</h1>
-          <p>You may now add components and start building.</p>
-          <p>We&apos;ve already added the button component for you.</p>
-          <Button className="mt-2">Button</Button>
-        </div>
-        <div className="text-muted-foreground font-mono text-xs">
-          (Press <kbd>d</kbd> to toggle dark mode)
-        </div>
-      </div>
+    <div className="min-h-screen bg-background text-foreground flex flex-col font-sans antialiased selection:bg-primary/20 selection:text-primary">
+      {/* Navbar Header */}
+      <Navbar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        user={user}
+        onOpenAuth={() => setAuthModalOpen(true)}
+        onLogout={handleLogout}
+      />
+
+      {/* Main Content Area */}
+      <main className="flex-1 mx-auto w-full max-w-7xl px-4 sm:px-6 pt-6">
+        {activeTab === "playground" && (
+          <Playground user={user} onOpenAuth={() => setAuthModalOpen(true)} />
+        )}
+        {activeTab === "keys" && (
+          <ApiKeys user={user} onOpenAuth={() => setAuthModalOpen(true)} />
+        )}
+        {activeTab === "submissions" && (
+          <Submissions user={user} onOpenAuth={() => setAuthModalOpen(true)} />
+        )}
+        {activeTab === "analytics" && (
+          <Analytics user={user} onOpenAuth={() => setAuthModalOpen(true)} />
+        )}
+        {activeTab === "quickstart" && <Quickstart />}
+      </main>
+
+      {/* Auth Modal (Login / Register) */}
+      <AuthModal
+        isOpen={authModalOpen}
+        onClose={() => setAuthModalOpen(false)}
+        onSuccess={(newUser) => setUser(newUser)}
+      />
     </div>
   )
 }
