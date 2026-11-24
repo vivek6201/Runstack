@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: coderunner-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-coderunner}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - coderunner-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: coderunner-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    env_file:
+      - .env
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - coderunner-net
+
+  execution-engine:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.execution-engine
+    container_name: coderunner-execution-engine
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${ENGINE_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - coderunner-net
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.dashboard
+    container_name: coderunner-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      execution-engine:
+        condition: service_started
+    networks:
+      - coderunner-net
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.web
+    container_name: coderunner-web
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      dashboard:
+        condition: service_started
+    networks:
+      - coderunner-net
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  coderunner-net:
+    driver: bridge

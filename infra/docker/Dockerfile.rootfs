@@ -1,0 +1,51 @@
+# ==============================================================================
+# Dockerfile for Firecracker MicroVM Root Filesystem
+# Pre-bakes runtimes for: Python, Node.js, Bun (TS), C, C++, Go, Java
+# Plus our custom Go Guest-Agent at /init
+# ==============================================================================
+
+# Stage 1: Build the Guest-Agent Go binary for Linux
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+ENV GOWORK=off
+ENV GOTOOLCHAIN=auto
+
+# Copy source code
+COPY services/shared /build/services/shared
+COPY services/execution-engine /build/services/execution-engine
+
+WORKDIR /build/services/execution-engine
+# Automatically build for the native architecture (arm64 on Apple Silicon, amd64 on x86_64)
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /init ./cmd/guest-agent
+
+# Stage 2: Minimal Alpine Rootfs with 7 Language Compilers & Runtimes
+FROM alpine:3.20
+
+# 1. Install base utilities & compilers
+RUN apk add --no-cache \
+    build-base \
+    gcc \
+    g++ \
+    musl-dev \
+    python3 \
+    nodejs \
+    openjdk17-jdk \
+    go \
+    curl \
+    bash
+
+# 2. Install standalone Bun for fast TypeScript execution
+RUN curl -fsSL https://bun.sh/install | bash && \
+    mv /root/.bun/bin/bun /usr/local/bin/bun && \
+    chmod +x /usr/local/bin/bun
+
+# 3. Create essential directories
+RUN mkdir -p /proc /sys /dev /workspace /run /tmp
+
+# 4. Copy custom Guest Agent as /init (PID 1)
+COPY --from=builder /init /init
+RUN chmod +x /init
+
+# Firecracker microVM starts /init directly
+ENTRYPOINT ["/init"]

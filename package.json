@@ -7,7 +7,19 @@
     "dev": "turbo dev",
     "lint": "turbo lint",
     "format": "turbo format",
-    "typecheck": "turbo typecheck"
+    "typecheck": "turbo typecheck",
+    "infra:up": "docker compose -f infra/docker-compose.full.yml up -d postgres redis",
+    "infra:down": "docker compose -f infra/docker-compose.full.yml stop postgres redis",
+    "infra:logs": "docker compose -f infra/docker-compose.full.yml logs -f postgres redis",
+    "docker:up": "docker compose -f infra/docker-compose.full.yml up --build -d",
+    "docker:down": "docker compose -f infra/docker-compose.full.yml down",
+    "docker:logs": "docker compose -f infra/docker-compose.full.yml logs -f",
+    "firecracker:setup": "./scripts/firecracker/download-firecracker.sh && ./scripts/firecracker/download-kernel.sh && ./scripts/firecracker/build-rootfs.sh",
+    "firecracker:up": "docker compose -f infra/docker-compose.firecracker.yml up --build -d",
+    "firecracker:down": "docker compose -f infra/docker-compose.firecracker.yml down",
+    "db:migrate": "atlas migrate apply --env local",
+    "dashboard:dev": "cd services/dashboard && go run ./cmd/server",
+    "engine:dev": "cd services/execution-engine && go run ./cmd/server"
   },
   "devDependencies": {
     "prettier": "^3.10.1",

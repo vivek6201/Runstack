@@ -1,0 +1,30 @@
+# ==============================================================================
+# Dockerfile: Dashboard API Service (Fiber + GORM + PostgreSQL + Redis)
+# ==============================================================================
+
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Disable go.work in container build to use relative replace directives in go.mod
+ENV GOWORK=off
+ENV GOTOOLCHAIN=auto
+
+# Copy shared data contracts and dashboard code
+COPY services/shared ./services/shared
+COPY services/dashboard ./services/dashboard
+
+WORKDIR /app/services/dashboard
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/dashboard ./cmd/server
+
+# Runtime Stage
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+COPY --from=builder /app/bin/dashboard .
+
+EXPOSE 8080
+
+CMD ["./dashboard"]

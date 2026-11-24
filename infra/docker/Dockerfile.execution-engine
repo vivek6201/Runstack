@@ -1,0 +1,45 @@
+# ==============================================================================
+# Dockerfile: Execution Engine Service
+# Contains: Go binary + 7 Language Compilers/Runtimes for Linux Execution
+# ==============================================================================
+
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+ENV GOWORK=off
+ENV GOTOOLCHAIN=auto
+
+COPY services/shared ./services/shared
+COPY services/execution-engine ./services/execution-engine
+
+WORKDIR /app/services/execution-engine
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/execution-engine ./cmd/server
+
+# Runtime Stage: equipped with all 7 compilers and runtimes
+FROM alpine:3.20
+
+# 1. Install standard compilers and runtimes
+RUN apk add --no-cache \
+    build-base \
+    gcc \
+    g++ \
+    musl-dev \
+    python3 \
+    nodejs \
+    openjdk17-jdk \
+    go \
+    curl \
+    bash \
+    ca-certificates
+
+# 2. Install standalone Bun for fast TypeScript execution
+RUN curl -fsSL https://bun.sh/install | bash && \
+    mv /root/.bun/bin/bun /usr/local/bin/bun && \
+    chmod +x /usr/local/bin/bun
+
+WORKDIR /app
+COPY --from=builder /app/bin/execution-engine .
+
+EXPOSE 8081
+
+CMD ["./execution-engine"]

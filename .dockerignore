@@ -1,0 +1,28 @@
+# VCS and Agents
+.git
+.gitignore
+.agents
+.claude
+.gemini
+.trail
+
+# Local Build Artifacts and Firecracker Disks (2.5GB)
+build/
+dist/
+tmp/
+*.ext4
+*.tar
+
+# Go Workspace files (Production containers use GOWORK=off + go.mod replace)
+services/go.work
+services/go.work.sum
+
+# Node dependencies
+node_modules/
+.turbo/
+.npm/
+.bun/
+
+# OS specific
+.DS_Store
+Thumbs.db
