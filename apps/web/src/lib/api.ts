@@ -9,15 +9,11 @@ import type {
   User,
 } from "../types"
 
-const API_BASE = "http://localhost:8080/api"
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api"
 
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const token = localStorage.getItem("token")
   const headers = new Headers(options.headers || {})
   headers.set("Content-Type", "application/json")
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`)
-  }
 
   const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
@@ -52,33 +48,26 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 }
 
 export const api = {
-  // Authentication
-  async register(email: string, password: string):Promise<{ user: User; token: string }> {
-    const res = await request<{ user: User; token: string }>("/auth/register", {
+  // Authentication (relies on HttpOnly SameSite cookie via credentials: "include")
+  async register(email: string, password: string): Promise<{ user: User }> {
+    return request<{ user: User }>("/auth/register", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     })
-    if (res.token) {
-      localStorage.setItem("token", res.token)
-    }
-    return res
   },
 
-  async login(email: string, password: string): Promise<{ user: User; token: string }> {
-    const res = await request<{ user: User; token: string }>("/auth/login", {
+  async login(email: string, password: string): Promise<{ user: User }> {
+    return request<{ user: User }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     })
-    if (res.token) {
-      localStorage.setItem("token", res.token)
-    }
-    return res
   },
 
   async logout(): Promise<void> {
     try {
       await request("/auth/logout", { method: "POST" })
     } finally {
+      // Purge any legacy token from earlier builds
       localStorage.removeItem("token")
     }
   },

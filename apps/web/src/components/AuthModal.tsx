@@ -96,13 +96,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
               <input
                 type="password"
                 required
-                minLength={6}
+                minLength={isLogin ? 6 : 8}
+                maxLength={72}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
                 className="w-full rounded-md border border-input bg-background py-2 pl-9 pr-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
             </div>
+            {!isLogin && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Must be 8–72 characters with at least one letter and one number.
+              </p>
+            )}
           </div>
 
           <button
