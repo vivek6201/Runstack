@@ -43,3 +43,20 @@ func TestGenerateAPIKey_Uniqueness(t *testing.T) {
 		t.Errorf("expected hashes to be unique, got identical hashes: %s", hash1)
 	}
 }
+
+func TestGenerateSessionToken(t *testing.T) {
+	raw1, hash1, err := crypto.GenerateSessionToken()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(raw1, "cr_sess_") || len(raw1) != len("cr_sess_")+64 {
+		t.Errorf("unexpected raw session token format: %q", raw1)
+	}
+	if len(hash1) != 64 || crypto.HashAPIKey(raw1) != hash1 {
+		t.Errorf("session token hash mismatch")
+	}
+	raw2, hash2, _ := crypto.GenerateSessionToken()
+	if raw1 == raw2 || hash1 == hash2 {
+		t.Errorf("expected unique session tokens")
+	}
+}

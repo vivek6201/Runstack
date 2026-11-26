@@ -35,3 +35,15 @@ func HashAPIKey(rawKey string) string {
 	sum := sha256.Sum256([]byte(rawKey))
 	return hex.EncodeToString(sum[:])
 }
+
+// GenerateSessionToken creates a cryptographically random opaque session token
+// and its SHA-256 hash (stored in PostgreSQL and Redis).
+func GenerateSessionToken() (rawToken string, tokenHash string, err error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate session bytes: %w", err)
+	}
+	rawToken = "cr_sess_" + hex.EncodeToString(bytes)
+	tokenHash = HashAPIKey(rawToken)
+	return rawToken, tokenHash, nil
+}

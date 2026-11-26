@@ -32,6 +32,8 @@ type User struct {
 	UpdatedAt    time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 
 	// Relations
-	APIKeys     []APIKey     `gorm:"foreignKey:UserID" json:"api_keys,omitempty"`
-	Submissions []Submission `gorm:"foreignKey:UserID" json:"submissions,omitempty"`
+	Profile     *Profile     `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;" json:"profile,omitempty"`
+	Sessions    []Session    `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;" json:"-"`
+	APIKeys     []APIKey     `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;" json:"api_keys,omitempty"`
+	Submissions []Submission `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE;" json:"submissions,omitempty"`
 }
