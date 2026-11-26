@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -16,6 +17,7 @@ type IAuthHandler interface {
 	LoginHandler(ctx fiber.Ctx) error
 	LogoutHandler(ctx fiber.Ctx) error
 	MeHandler(ctx fiber.Ctx) error
+	SessionHandler(ctx fiber.Ctx) error
 }
 
 type AuthHandler struct {
@@ -36,7 +38,8 @@ func (h *AuthHandler) RegisterHandler(ctx fiber.Ctx) error {
 		return response.BadRequest(ctx, "invalid registration payload: "+err.Error())
 	}
 
-	resp, err := h.service.Register(ctx.Context(), req)
+	meta := extractSessionMetadata(ctx)
+	resp, err := h.service.Register(ctx.Context(), req, meta)
 	if err != nil {
 		if errors.Is(err, ErrUserAlreadyExists) {
 			return response.Error(ctx, fiber.StatusConflict, err.Error())
@@ -54,7 +57,8 @@ func (h *AuthHandler) LoginHandler(ctx fiber.Ctx) error {
 		return response.BadRequest(ctx, "invalid login payload")
 	}
 
-	resp, err := h.service.Login(ctx.Context(), req)
+	meta := extractSessionMetadata(ctx)
+	resp, err := h.service.Login(ctx.Context(), req, meta)
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) {
 			return response.Unauthorized(ctx, err.Error())
@@ -67,6 +71,9 @@ func (h *AuthHandler) LoginHandler(ctx fiber.Ctx) error {
 }
 
 func (h *AuthHandler) LogoutHandler(ctx fiber.Ctx) error {
+	rawToken := ExtractSessionToken(ctx)
+	_ = h.service.Logout(ctx.Context(), rawToken)
+
 	ctx.Cookie(&fiber.Cookie{
 		Name:     "token",
 		Value:    "",
@@ -92,6 +99,33 @@ func (h *AuthHandler) MeHandler(ctx fiber.Ctx) error {
 	}
 
 	return response.Success(ctx, user)
+}
+
+func (h *AuthHandler) SessionHandler(ctx fiber.Ctx) error {
+	sc, ok := ctx.Locals("session").(*SessionContext)
+	if !ok || sc == nil {
+		return response.Unauthorized(ctx, "unauthorized")
+	}
+	return response.Success(ctx, sc.ToSessionInfo())
+}
+
+// ExtractSessionToken resolves the opaque session token from Authorization header or "token" cookie.
+func ExtractSessionToken(ctx fiber.Ctx) string {
+	authHeader := ctx.Get("Authorization")
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+	return ctx.Cookies("token")
+}
+
+func extractSessionMetadata(ctx fiber.Ctx) SessionMetadata {
+	ua := ctx.Get("User-Agent")
+	return SessionMetadata{
+		Provider:   "password",
+		IPAddress:  ctx.IP(),
+		UserAgent:  ua,
+		DeviceName: ParseDeviceName(ua),
+	}
 }
 
 func (h *AuthHandler) setAuthCookie(ctx fiber.Ctx, token string, expiresAt time.Time) {

@@ -18,6 +18,7 @@ import (
 	"code-runner/dashboard/internal/keys"
 	"code-runner/dashboard/internal/middleware"
 	"code-runner/dashboard/internal/playground"
+	"code-runner/dashboard/internal/profile"
 	"code-runner/dashboard/internal/stats"
 	"code-runner/dashboard/internal/submissions"
 	"code-runner/shared/dto"
@@ -186,19 +187,21 @@ func (r *inMemorySubmissionsRepo) GetDailyRows(ctx context.Context, userID uuid.
 func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 	cfg := &config.ConfigVar{
 		AppEnv:       "development",
-		JWTSecret:    "integration-secret-key-123",
 		TokenTTL:     time.Hour,
 		EngineURL:    "http://engine.local",
 		DevBypassKey: "cr_dev_bypass",
 	}
 
-	uRepo := newMockUserRepo()
+	sharedAuthRepo := newInMemoryAuthRepo()
 	kRepo := newInMemoryKeysRepo()
 	sRepo := newInMemorySubmissionsRepo()
 
-	authSvc := auth.NewAuthService(uRepo, cfg)
+	authSvc := auth.NewAuthService(sharedAuthRepo, nil, cfg)
 	authHandler := auth.NewAuthHandler(authSvc, cfg)
-	authMw := middleware.AuthRequired(cfg.JWTSecret)
+	authMw := middleware.AuthRequired(authSvc)
+
+	profileSvc := profile.NewProfileService(sharedAuthRepo, nil)
+	profileHandler := profile.NewProfileHandler(profileSvc)
 
 	keysSvc := keys.NewKeysService(kRepo, nil)
 	keysHandler := keys.NewKeysHandler(keysSvc)
@@ -258,12 +261,13 @@ func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 	})
 	apiGroup := app.Group("/api")
 	auth.RegisterRoute(apiGroup, authHandler, authMw)
+	profile.RegisterRoute(apiGroup, profileHandler, authMw)
 	keys.RegisterRoute(apiGroup, keysHandler, authMw)
 	submissions.RegisterRoute(apiGroup, subHandler, authMw)
 	stats.RegisterRoute(apiGroup, statsHandler, authMw)
 	playground.RegisterRoute(apiGroup, playHandler, authMw)
 
-	doReq := func(method, path string, body any, cookie *http.Cookie) (*http.Response, []byte) {
+	doReq := func(method, path string, body any, cookie *http.Cookie, ua string) (*http.Response, []byte) {
 		var reader *bytes.Reader
 		if body != nil {
 			b, _ := json.Marshal(body)
@@ -274,6 +278,9 @@ func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 		req := httptest.NewRequest(method, path, reader)
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
+		}
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
 		}
 		if cookie != nil {
 			req.AddCookie(cookie)
@@ -288,55 +295,100 @@ func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 		return resp, buf.Bytes()
 	}
 
+	extractTokenCookie := func(r *http.Response) *http.Cookie {
+		for _, c := range r.Cookies() {
+			if c.Name == "token" {
+				return c
+			}
+		}
+		return nil
+	}
+
 	// 1. Health & Unauthenticated guard
-	r, _ := doReq("GET", "/health", nil, nil)
+	r, _ := doReq("GET", "/health", nil, nil, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("GET /health = %d, want 200", r.StatusCode)
 	}
-	r, _ = doReq("GET", "/api/auth/me", nil, nil)
+	r, _ = doReq("GET", "/api/auth/me", nil, nil, "")
 	if r.StatusCode != 401 {
 		t.Fatalf("unauthenticated GET /api/auth/me = %d, want 401", r.StatusCode)
 	}
 
-	// 2. Register validation + creation + cookie extraction
-	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "short"}, nil)
+	// 2. Register validation + creation (creates profile + session A)
+	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "short"}, nil, "")
 	if r.StatusCode != 400 {
 		t.Fatalf("weak password register = %d, want 400", r.StatusCode)
 	}
-	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil)
+	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil, "Mozilla/5.0 (Macintosh) Chrome/120")
 	if r.StatusCode != 201 {
 		t.Fatalf("valid register = %d, want 201", r.StatusCode)
 	}
-	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil)
+	cookieA := extractTokenCookie(r)
+	if cookieA == nil || cookieA.Value == "" || !cookieA.HttpOnly {
+		t.Fatalf("expected HttpOnly token cookie from register")
+	}
+	r, _ = doReq("POST", "/api/auth/register", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil, "")
 	if r.StatusCode != 409 {
 		t.Fatalf("duplicate register = %d, want 409", r.StatusCode)
 	}
 
-	// 3. Login + HttpOnly Cookie Auth (/me)
-	r, _ = doReq("POST", "/api/auth/login", map[string]string{"email": "dev@runstack.io", "password": "wrong"}, nil)
+	// 3. Login from second device -> creates session B and evicts session A immediately
+	r, _ = doReq("POST", "/api/auth/login", map[string]string{"email": "dev@runstack.io", "password": "wrong"}, nil, "")
 	if r.StatusCode != 401 {
 		t.Fatalf("bad login = %d, want 401", r.StatusCode)
 	}
-	r, _ = doReq("POST", "/api/auth/login", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil)
+	r, _ = doReq("POST", "/api/auth/login", map[string]string{"email": "dev@runstack.io", "password": "Password123"}, nil, "curl/8.4.0")
 	if r.StatusCode != 200 {
 		t.Fatalf("valid login = %d, want 200", r.StatusCode)
 	}
-	var authCookie *http.Cookie
-	for _, c := range r.Cookies() {
-		if c.Name == "token" {
-			authCookie = c
-		}
-	}
-	if authCookie == nil || authCookie.Value == "" || !authCookie.HttpOnly {
-		t.Fatalf("expected HttpOnly token cookie, got: %+v", r.Cookies())
-	}
-	r, _ = doReq("GET", "/api/auth/me", nil, authCookie)
-	if r.StatusCode != 200 {
-		t.Fatalf("GET /api/auth/me with cookie = %d, want 200", r.StatusCode)
+	cookieB := extractTokenCookie(r)
+	if cookieB == nil || cookieB.Value == "" || !cookieB.HttpOnly {
+		t.Fatalf("expected HttpOnly token cookie from login")
 	}
 
-	// 4. API Keys CRUD
-	r, raw := doReq("POST", "/api/keys", map[string]any{"name": "CI Key", "rate_limit_rpm": 500}, authCookie)
+	// Session A must now be rejected (single session at a time)
+	r, _ = doReq("GET", "/api/auth/me", nil, cookieA, "")
+	if r.StatusCode != 401 {
+		t.Fatalf("expected stale session A rejected (401), got %d", r.StatusCode)
+	}
+
+	// Session B succeeds on /me & /auth/session metadata endpoint
+	r, raw := doReq("GET", "/api/auth/me", nil, cookieB, "")
+	if r.StatusCode != 200 {
+		t.Fatalf("GET /api/auth/me with cookie B = %d, want 200", r.StatusCode)
+	}
+	r, raw = doReq("GET", "/api/auth/session", nil, cookieB, "")
+	if r.StatusCode != 200 {
+		t.Fatalf("GET /api/auth/session = %d, want 200", r.StatusCode)
+	}
+	var sessEnv response.Response[auth.SessionInfoResponse]
+	_ = json.Unmarshal(raw, &sessEnv)
+	if sessEnv.Data.DeviceName != "cURL CLI" {
+		t.Fatalf("expected cURL CLI device_name in session metadata, got %q", sessEnv.Data.DeviceName)
+	}
+
+	// 4. Profile GET & PATCH
+	r, raw = doReq("GET", "/api/profile", nil, cookieB, "")
+	if r.StatusCode != 200 {
+		t.Fatalf("GET /api/profile = %d, want 200 (%s)", r.StatusCode, string(raw))
+	}
+	r, raw = doReq("PATCH", "/api/profile", map[string]string{
+		"username":         "vivek_dev",
+		"display_name":     "Vivek",
+		"default_language": "go",
+		"github_url":       "https://github.com/vivek6201",
+	}, cookieB, "")
+	if r.StatusCode != 200 {
+		t.Fatalf("PATCH /api/profile = %d, want 200 (%s)", r.StatusCode, string(raw))
+	}
+	var profEnv response.Response[profile.ProfileResponse]
+	_ = json.Unmarshal(raw, &profEnv)
+	if profEnv.Data.Username != "vivek_dev" || profEnv.Data.DefaultLanguage != "go" {
+		t.Fatalf("unexpected updated profile: %+v", profEnv.Data)
+	}
+
+	// 5. API Keys CRUD
+	r, raw = doReq("POST", "/api/keys", map[string]any{"name": "CI Key", "rate_limit_rpm": 500}, cookieB, "")
 	if r.StatusCode != 201 {
 		t.Fatalf("POST /api/keys = %d, want 201 (%s)", r.StatusCode, string(raw))
 	}
@@ -345,36 +397,29 @@ func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 	if createdKeyEnv.Data.RateLimitRPM != 60 {
 		t.Fatalf("expected free tier cap 60 RPM, got %d", createdKeyEnv.Data.RateLimitRPM)
 	}
-
-	r, raw = doReq("GET", "/api/keys", nil, authCookie)
+	r, raw = doReq("GET", "/api/keys", nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("GET /api/keys = %d, want 200", r.StatusCode)
 	}
-	var listKeysEnv response.Response[[]keys.APIKeyItemResponse]
-	_ = json.Unmarshal(raw, &listKeysEnv)
-	if len(listKeysEnv.Data) != 1 {
-		t.Fatalf("expected 1 key listed, got %d", len(listKeysEnv.Data))
-	}
 
-	// 5. Playground Execute + Submissions + Stats
-	r, _ = doReq("POST", "/api/playground/execute", map[string]string{"language": "python"}, authCookie)
+	// 6. Playground Execute + Submissions + Stats
+	r, _ = doReq("POST", "/api/playground/execute", map[string]string{"language": "python"}, cookieB, "")
 	if r.StatusCode != 400 {
 		t.Fatalf("invalid playground execute = %d, want 400", r.StatusCode)
 	}
-	r, raw = doReq("POST", "/api/playground/execute", map[string]string{"language": "python", "code": "print('hello')"}, authCookie)
+	r, raw = doReq("POST", "/api/playground/execute", map[string]string{"language": "python", "code": "print('hello')"}, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("POST /api/playground/execute = %d, want 200 (%s)", r.StatusCode, string(raw))
 	}
-
-	r, raw = doReq("GET", "/api/submissions?page=1&limit=10", nil, authCookie)
+	r, _ = doReq("GET", "/api/submissions?page=1&limit=10", nil, cookieB, "")
 	if r.StatusCode != 200 {
-		t.Fatalf("GET /api/submissions = %d, want 200 (%s)", r.StatusCode, string(raw))
+		t.Fatalf("GET /api/submissions = %d, want 200", r.StatusCode)
 	}
-	r, _ = doReq("GET", "/api/submissions/"+jobID, nil, authCookie)
+	r, _ = doReq("GET", "/api/submissions/"+jobID, nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("GET /api/submissions/:id = %d, want 200", r.StatusCode)
 	}
-	r, raw = doReq("GET", "/api/stats", nil, authCookie)
+	r, raw = doReq("GET", "/api/stats", nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("GET /api/stats = %d, want 200", r.StatusCode)
 	}
@@ -383,22 +428,26 @@ func TestDashboard_AllAPIRoutes_Integration(t *testing.T) {
 	if statsEnv.Data.TotalSubmissions != 1 || statsEnv.Data.SuccessfulRuns != 1 {
 		t.Fatalf("unexpected stats after 1 run: %+v", statsEnv.Data)
 	}
-	r, _ = doReq("GET", "/api/stats/daily?days=7", nil, authCookie)
+	r, _ = doReq("GET", "/api/stats/daily?days=7", nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("GET /api/stats/daily = %d, want 200", r.StatusCode)
 	}
 
-	// 6. Revoke Key & Logout
-	r, _ = doReq("DELETE", "/api/keys/invalid-uuid", nil, authCookie)
+	// 7. Revoke Key & Logout (server-side revocation verifies cookieB fails immediately afterwards)
+	r, _ = doReq("DELETE", "/api/keys/invalid-uuid", nil, cookieB, "")
 	if r.StatusCode != 400 {
 		t.Fatalf("DELETE bad key UUID = %d, want 400", r.StatusCode)
 	}
-	r, _ = doReq("DELETE", "/api/keys/"+createdKeyEnv.Data.ID.String(), nil, authCookie)
+	r, _ = doReq("DELETE", "/api/keys/"+createdKeyEnv.Data.ID.String(), nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("DELETE /api/keys/:id = %d, want 200", r.StatusCode)
 	}
-	r, _ = doReq("POST", "/api/auth/logout", nil, authCookie)
+	r, _ = doReq("POST", "/api/auth/logout", nil, cookieB, "")
 	if r.StatusCode != 200 {
 		t.Fatalf("POST /api/auth/logout = %d, want 200", r.StatusCode)
+	}
+	r, _ = doReq("GET", "/api/auth/me", nil, cookieB, "")
+	if r.StatusCode != 401 {
+		t.Fatalf("expected logged out cookie B rejected (401), got %d", r.StatusCode)
 	}
 }

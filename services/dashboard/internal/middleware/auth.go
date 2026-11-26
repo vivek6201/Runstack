@@ -1,39 +1,28 @@
 package middleware
 
 import (
-	"strings"
-
 	"github.com/gofiber/fiber/v3"
 
 	"code-runner/dashboard/internal/auth"
 	"code-runner/shared/response"
 )
 
-// AuthRequired protects dashboard routes using Bearer tokens or HttpOnly cookies.
-func AuthRequired(jwtSecret string) fiber.Handler {
+// AuthRequired protects dashboard routes via server-side sessions backed by Redis + PostgreSQL.
+func AuthRequired(authSvc auth.IAuthService) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		var tokenStr string
-
-		authHeader := c.Get("Authorization")
-		if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
-			tokenStr = strings.TrimSpace(authHeader[7:])
-		}
-
-		if tokenStr == "" {
-			tokenStr = c.Cookies("token")
-		}
-
-		if tokenStr == "" {
+		rawToken := auth.ExtractSessionToken(c)
+		if rawToken == "" {
 			return response.Unauthorized(c, "missing authentication token")
 		}
 
-		claims, err := auth.ParseToken(tokenStr, jwtSecret)
+		sessionCtx, err := authSvc.ValidateSession(c.Context(), rawToken)
 		if err != nil {
-			return response.Unauthorized(c, "invalid or expired authentication token")
+			return response.Unauthorized(c, "invalid, expired, or superseded session")
 		}
 
-		c.Locals("claims", claims)
-		c.Locals("user_id", claims.UserID)
+		c.Locals("session", sessionCtx)
+		c.Locals("claims", sessionCtx.ToClaims())
+		c.Locals("user_id", sessionCtx.UserID)
 		return c.Next()
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"code-runner/dashboard/internal/keys"
 	"code-runner/dashboard/internal/middleware"
 	"code-runner/dashboard/internal/playground"
+	"code-runner/dashboard/internal/profile"
 	"code-runner/dashboard/internal/stats"
 	"code-runner/dashboard/internal/submissions"
 )
@@ -26,11 +27,16 @@ func SetupRoutes(app *fiber.App, db *gorm.DB, rdb *redis.Client, cfg *config.Con
 		})
 	})
 
-	// ── Auth ──────────────────────────────────────────────────────────────────
+	// ── Auth & Single-Session Guard ───────────────────────────────────────────
 	authRepo := auth.NewAuthRepository(db)
-	authService := auth.NewAuthService(authRepo, cfg)
+	authService := auth.NewAuthService(authRepo, auth.NewCaches(rdb), cfg)
 	authHandler := auth.NewAuthHandler(authService, cfg)
-	authMiddleware := middleware.AuthRequired(cfg.JWTSecret)
+	authMiddleware := middleware.AuthRequired(authService)
+
+	// ── Profile ───────────────────────────────────────────────────────────────
+	profileRepo := profile.NewProfileRepository(db)
+	profileService := profile.NewProfileService(profileRepo, profile.NewCaches(rdb))
+	profileHandler := profile.NewProfileHandler(profileService)
 
 	// ── Keys ──────────────────────────────────────────────────────────────────
 	keysRepo := keys.NewKeysRepository(db)
@@ -60,6 +66,7 @@ func SetupRoutes(app *fiber.App, db *gorm.DB, rdb *redis.Client, cfg *config.Con
 		generalGroup := apiGroup.Group("", generalLimiter)
 
 		auth.RegisterRoute(authGroup, authHandler, authMiddleware)
+		profile.RegisterRoute(generalGroup, profileHandler, authMiddleware)
 		keys.RegisterRoute(generalGroup, keysHandler, authMiddleware)
 		submissions.RegisterRoute(generalGroup, subHandler, authMiddleware)
 		stats.RegisterRoute(generalGroup, statsHandler, authMiddleware)

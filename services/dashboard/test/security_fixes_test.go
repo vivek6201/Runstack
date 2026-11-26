@@ -18,53 +18,151 @@ import (
 	"code-runner/dashboard/internal/auth"
 	"code-runner/dashboard/internal/config"
 	"code-runner/dashboard/internal/playground"
+	"code-runner/dashboard/internal/profile"
 	"code-runner/shared/dto"
 	"code-runner/shared/models"
 	"code-runner/shared/response"
 	sharedValidator "code-runner/shared/validator"
 )
 
-type mockUserRepo struct {
-	users map[string]*models.User
+type inMemoryAuthRepo struct {
+	mu       sync.Mutex
+	users    map[string]*models.User
+	profiles map[uuid.UUID]*models.Profile
+	sessions map[string]*models.Session
 }
 
-func newMockUserRepo() *mockUserRepo {
-	return &mockUserRepo{users: make(map[string]*models.User)}
+func newInMemoryAuthRepo() *inMemoryAuthRepo {
+	return &inMemoryAuthRepo{
+		users:    make(map[string]*models.User),
+		profiles: make(map[uuid.UUID]*models.Profile),
+		sessions: make(map[string]*models.Session),
+	}
 }
 
-func (m *mockUserRepo) Create(ctx context.Context, user *models.User) error {
-	m.users[user.Email] = user
+func (m *inMemoryAuthRepo) CreateWithProfile(ctx context.Context, user *models.User, prof *models.Profile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	uCopy := *user
+	pCopy := *prof
+	m.users[user.Email] = &uCopy
+	m.profiles[user.ID] = &pCopy
 	return nil
 }
 
-func (m *mockUserRepo) FindByID(ctx context.Context, id uuid.UUID) (*models.User, error) {
+func (m *inMemoryAuthRepo) FindByIDWithProfile(ctx context.Context, id uuid.UUID) (*models.User, *models.Profile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, u := range m.users {
 		if u.ID == id {
-			return u, nil
+			uCopy := *u
+			if p, ok := m.profiles[id]; ok {
+				pCopy := *p
+				return &uCopy, &pCopy, nil
+			}
+			return &uCopy, nil, nil
 		}
 	}
-	return nil, auth.ErrUserNotFound
+	return nil, nil, auth.ErrUserNotFound
 }
 
-func (m *mockUserRepo) FindByEmail(ctx context.Context, email string) (*models.User, error) {
+func (m *inMemoryAuthRepo) FindByEmail(ctx context.Context, email string) (*models.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if u, ok := m.users[email]; ok {
-		return u, nil
+		uCopy := *u
+		return &uCopy, nil
 	}
 	return nil, auth.ErrUserNotFound
 }
 
-func (m *mockUserRepo) Update(ctx context.Context, user *models.User) error {
-	m.users[user.Email] = user
+func (m *inMemoryAuthRepo) CreateSingleSession(ctx context.Context, sess *models.Session) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var evicted []string
+	for id, existing := range m.sessions {
+		if existing.UserID == sess.UserID {
+			evicted = append(evicted, id)
+			delete(m.sessions, id)
+		}
+	}
+	sCopy := *sess
+	m.sessions[sess.ID] = &sCopy
+	return evicted, nil
+}
+
+func (m *inMemoryAuthRepo) FindSessionByID(ctx context.Context, sessionHash string) (*models.Session, *models.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.sessions[sessionHash]
+	if !ok {
+		return nil, nil, auth.ErrSessionInvalid
+	}
+	for _, u := range m.users {
+		if u.ID == sess.UserID {
+			sCopy := *sess
+			uCopy := *u
+			return &sCopy, &uCopy, nil
+		}
+	}
+	return nil, nil, auth.ErrSessionInvalid
+}
+
+func (m *inMemoryAuthRepo) DeleteSession(ctx context.Context, sessionHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, sessionHash)
+	return nil
+}
+
+func (m *inMemoryAuthRepo) TouchSession(ctx context.Context, sessionHash string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sess, ok := m.sessions[sessionHash]; ok {
+		sess.LastActiveAt = now
+	}
+	return nil
+}
+
+// Adapter exposing inMemoryAuthRepo profiles map as profile.IProfileRepository
+func (m *inMemoryAuthRepo) FindByUserID(ctx context.Context, userID uuid.UUID) (*models.Profile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.profiles[userID]
+	if !ok {
+		return nil, profile.ErrProfileNotFound
+	}
+	pCopy := *p
+	return &pCopy, nil
+}
+
+func (m *inMemoryAuthRepo) FindByUsername(ctx context.Context, username string) (*models.Profile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.profiles {
+		if p.Username == username {
+			pCopy := *p
+			return &pCopy, nil
+		}
+	}
+	return nil, profile.ErrProfileNotFound
+}
+
+func (m *inMemoryAuthRepo) Update(ctx context.Context, prof *models.Profile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pCopy := *prof
+	pCopy.UpdatedAt = time.Now().UTC()
+	m.profiles[prof.UserID] = &pCopy
 	return nil
 }
 
 func TestAuthService_PasswordAndEmailPolicy(t *testing.T) {
-	repo := newMockUserRepo()
+	repo := newInMemoryAuthRepo()
 	cfg := &config.ConfigVar{
-		JWTSecret: "test-jwt-secret",
-		TokenTTL:  time.Hour,
+		TokenTTL: time.Hour,
 	}
-	svc := auth.NewAuthService(repo, cfg)
+	svc := auth.NewAuthService(repo, nil, cfg)
 
 	invalidCases := []struct {
 		name     string
@@ -84,7 +182,7 @@ func TestAuthService_PasswordAndEmailPolicy(t *testing.T) {
 			_, err := svc.Register(context.Background(), auth.RegisterRequest{
 				Email:    tc.email,
 				Password: tc.password,
-			})
+			}, auth.SessionMetadata{})
 			if err == nil {
 				t.Errorf("expected Register to reject %s, but succeeded", tc.name)
 			}
@@ -94,12 +192,67 @@ func TestAuthService_PasswordAndEmailPolicy(t *testing.T) {
 	resp, err := svc.Register(context.Background(), auth.RegisterRequest{
 		Email:    "valid@example.com",
 		Password: "StrongPassword123",
+	}, auth.SessionMetadata{
+		IPAddress: "203.0.113.10",
+		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X) Chrome/120.0",
 	})
 	if err != nil {
 		t.Fatalf("expected valid registration to succeed, got error: %v", err)
 	}
-	if resp.User.Email != "valid@example.com" || resp.Token == "" {
-		t.Errorf("unexpected registration response: %+v", resp)
+	if resp.User.Email != "valid@example.com" || resp.Token == "" || resp.User.Profile == nil {
+		t.Fatalf("unexpected registration response: %+v", resp)
+	}
+	if resp.Session == nil || resp.Session.DeviceName != "macOS • Chrome" {
+		t.Errorf("expected parsed session device metadata, got %+v", resp.Session)
+	}
+}
+
+func TestAuthService_SingleActiveSession_LatestLoginWins(t *testing.T) {
+	repo := newInMemoryAuthRepo()
+	svc := auth.NewAuthService(repo, nil, &config.ConfigVar{TokenTTL: time.Hour})
+
+	regResp, err := svc.Register(context.Background(), auth.RegisterRequest{
+		Email:    "solo@runstack.io",
+		Password: "Password123",
+	}, auth.SessionMetadata{IPAddress: "10.0.0.1", UserAgent: "Mozilla/5.0 (Macintosh) Chrome/120"})
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+	tokenDeviceA := regResp.Token
+
+	// Device A session works before Device B logs in
+	scA, err := svc.ValidateSession(context.Background(), tokenDeviceA)
+	if err != nil || scA.IPAddress != "10.0.0.1" {
+		t.Fatalf("expected Device A session valid, err=%v", err)
+	}
+
+	// Device B logs in -> must evict Device A
+	loginResp, err := svc.Login(context.Background(), auth.LoginRequest{
+		Email:    "solo@runstack.io",
+		Password: "Password123",
+	}, auth.SessionMetadata{IPAddress: "10.0.0.2", UserAgent: "Mozilla/5.0 (Windows NT) Firefox/121"})
+	if err != nil {
+		t.Fatalf("device B login failed: %v", err)
+	}
+	tokenDeviceB := loginResp.Token
+
+	// Device A must immediately fail validation
+	if _, err := svc.ValidateSession(context.Background(), tokenDeviceA); err == nil {
+		t.Fatalf("SECURITY FAILURE: Device A session remained active after Device B login")
+	}
+
+	// Device B must succeed with updated metadata
+	scB, err := svc.ValidateSession(context.Background(), tokenDeviceB)
+	if err != nil || scB.IPAddress != "10.0.0.2" || scB.DeviceName != "Windows • Firefox" {
+		t.Fatalf("expected Device B session with updated metadata, got sc=%+v err=%v", scB, err)
+	}
+
+	// Explicit logout invalidates Device B
+	if err := svc.Logout(context.Background(), tokenDeviceB); err != nil {
+		t.Fatalf("logout failed: %v", err)
+	}
+	if _, err := svc.ValidateSession(context.Background(), tokenDeviceB); err == nil {
+		t.Fatalf("expected Device B session invalidated after logout")
 	}
 }
 

@@ -2,7 +2,7 @@ package auth
 
 import "github.com/gofiber/fiber/v3"
 
-// RegisterRoute registers authentication endpoints onto the router group.
+// RegisterRoute registers authentication and session lifecycle routes onto the router group.
 func RegisterRoute(r fiber.Router, handler IAuthHandler, authMiddleware fiber.Handler) {
 	authRoutes := r.Group("/auth")
 	{
@@ -10,5 +10,6 @@ func RegisterRoute(r fiber.Router, handler IAuthHandler, authMiddleware fiber.Ha
 		authRoutes.Post("/login", handler.LoginHandler)
 		authRoutes.Post("/logout", handler.LogoutHandler)
 		authRoutes.Get("/me", authMiddleware, handler.MeHandler)
+		authRoutes.Get("/session", authMiddleware, handler.SessionHandler)
 	}
 }
