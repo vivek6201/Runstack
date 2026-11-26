@@ -51,7 +51,8 @@ RUN apk add --no-cache \
     go \
     curl \
     bash \
-    ca-certificates
+    ca-certificates \
+    su-exec
 
 # 2. Install standalone Bun for fast TypeScript execution & create unprivileged runner user
 RUN curl -fsSL --proto '=https' --tlsv1.2 https://bun.sh/install | bash && \
@@ -63,9 +64,10 @@ RUN curl -fsSL --proto '=https' --tlsv1.2 https://bun.sh/install | bash && \
 
 WORKDIR /app
 COPY --from=builder --chown=runner:runner /app/bin/execution-engine .
-
-USER runner
+COPY infra/docker/entrypoint.execution-engine.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 EXPOSE 8081
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["./execution-engine"]
