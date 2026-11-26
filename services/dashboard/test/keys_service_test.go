@@ -7,7 +7,6 @@ import (
 	"github.com/google/uuid"
 
 	"code-runner/dashboard/internal/keys"
-	"code-runner/shared/dto"
 	"code-runner/shared/models"
 )
 
@@ -38,12 +37,12 @@ func (m *mockAPIKeyRepo) Revoke(ctx context.Context, userID, keyID uuid.UUID) er
 
 func TestKeysService_PlanTierLimitsEnforced(t *testing.T) {
 	mockRepo := &mockAPIKeyRepo{}
-	svc := keys.NewService(mockRepo, nil)
+	svc := keys.NewKeysService(mockRepo, nil)
 
 	userID := uuid.New()
 
 	// 1. Free tier user attempts to request 1,000,000 RPM and 500 concurrency
-	resp, err := svc.CreateKey(context.Background(), userID, models.PlanFree, dto.CreateAPIKeyRequest{
+	resp, err := svc.CreateKey(context.Background(), userID, models.PlanFree, keys.CreateAPIKeyRequest{
 		Name:           "Free User Exploiting Limits",
 		RateLimitRPM:   1000000,
 		MaxConcurrency: 500,
@@ -61,7 +60,7 @@ func TestKeysService_PlanTierLimitsEnforced(t *testing.T) {
 	}
 
 	// 2. Pro tier user requesting within limits (e.g. 500 RPM, 15 concurrency)
-	respPro, err := svc.CreateKey(context.Background(), userID, models.PlanPro, dto.CreateAPIKeyRequest{
+	respPro, err := svc.CreateKey(context.Background(), userID, models.PlanPro, keys.CreateAPIKeyRequest{
 		Name:           "Pro User Custom Limits",
 		RateLimitRPM:   500,
 		MaxConcurrency: 15,

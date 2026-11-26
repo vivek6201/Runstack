@@ -9,13 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 
 	"code-runner/execution-engine/internal/adapters/executor"
 	"code-runner/execution-engine/internal/api"
 	"code-runner/execution-engine/internal/worker"
 	"code-runner/shared/dto"
 	"code-runner/shared/response"
+	sharedValidator "code-runner/shared/validator"
 )
 
 // In-memory queue with channels for a true concurrent E2E test
@@ -47,6 +48,10 @@ func (c *channelQueueStore) Dequeue(ctx context.Context) (*dto.Job, error) {
 	case job := <-c.jobChan:
 		return job, nil
 	}
+}
+
+func (c *channelQueueStore) Ack(ctx context.Context, jobID string) error {
+	return nil
 }
 
 func (c *channelQueueStore) SetStatus(ctx context.Context, jobID string, status dto.JobStatus) error {
@@ -102,9 +107,11 @@ func TestE2E_FullFlow(t *testing.T) {
 
 	// 3. Setup Fiber API
 	handler := api.NewHandler(qs, qs)
-	app := fiber.New()
-	app.Post("/v1/submit", handler.Submit)
-	app.Get("/v1/status/:id", handler.Status)
+	app := fiber.New(fiber.Config{
+		StructValidator: sharedValidator.NewStructValidator(),
+	})
+	app.Post("/v1/submit", handler.SubmitHandler)
+	app.Get("/v1/status/:id", handler.StatusHandler)
 
 	// 4. Submit Python code via API
 	payload := dto.SubmitRequest{

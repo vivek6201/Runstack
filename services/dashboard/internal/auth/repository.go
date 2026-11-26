@@ -1,4 +1,4 @@
-package user
+package auth
 
 import (
 	"context"
@@ -11,30 +11,31 @@ import (
 )
 
 var (
-	ErrUserNotFound      = errors.New("user not found")
-	ErrUserAlreadyExists = errors.New("user with this email already exists")
+	ErrUserNotFound       = errors.New("user not found")
+	ErrUserAlreadyExists  = errors.New("user with this email already exists")
+	ErrInvalidCredentials = errors.New("invalid email or password")
 )
 
-type Repository interface {
+type IAuthRepository interface {
 	Create(ctx context.Context, user *models.User) error
 	FindByID(ctx context.Context, id uuid.UUID) (*models.User, error)
 	FindByEmail(ctx context.Context, email string) (*models.User, error)
 	Update(ctx context.Context, user *models.User) error
 }
 
-type GormRepository struct {
+type AuthRepository struct {
 	db *gorm.DB
 }
 
-func NewRepository(db *gorm.DB) *GormRepository {
-	return &GormRepository{db: db}
+func NewAuthRepository(db *gorm.DB) IAuthRepository {
+	return &AuthRepository{db: db}
 }
 
-func (r *GormRepository) Create(ctx context.Context, user *models.User) error {
+func (r *AuthRepository) Create(ctx context.Context, user *models.User) error {
 	return r.db.WithContext(ctx).Create(user).Error
 }
 
-func (r *GormRepository) FindByID(ctx context.Context, id uuid.UUID) (*models.User, error) {
+func (r *AuthRepository) FindByID(ctx context.Context, id uuid.UUID) (*models.User, error) {
 	var u models.User
 	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&u).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -45,7 +46,7 @@ func (r *GormRepository) FindByID(ctx context.Context, id uuid.UUID) (*models.Us
 	return &u, nil
 }
 
-func (r *GormRepository) FindByEmail(ctx context.Context, email string) (*models.User, error) {
+func (r *AuthRepository) FindByEmail(ctx context.Context, email string) (*models.User, error) {
 	var u models.User
 	if err := r.db.WithContext(ctx).Where("email = ?", email).First(&u).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -56,6 +57,6 @@ func (r *GormRepository) FindByEmail(ctx context.Context, email string) (*models
 	return &u, nil
 }
 
-func (r *GormRepository) Update(ctx context.Context, user *models.User) error {
+func (r *AuthRepository) Update(ctx context.Context, user *models.User) error {
 	return r.db.WithContext(ctx).Save(user).Error
 }

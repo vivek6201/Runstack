@@ -7,8 +7,6 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormLogger "gorm.io/gorm/logger"
-
-	"code-runner/shared/models"
 )
 
 // Connect initializes a PostgreSQL connection via GORM and configures connection pooling.
@@ -49,13 +47,4 @@ func Connect(cfg *Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 
 	return db, nil
-}
-
-// AutoMigrate migrates all shared GORM entity schemas into the connected database.
-func AutoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(
-		&models.User{},
-		&models.APIKey{},
-		&models.Submission{},
-	)
 }

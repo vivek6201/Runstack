@@ -8,7 +8,7 @@ import (
 
 // APIKey represents a machine-to-machine authentication credential.
 type APIKey struct {
-	ID            uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	ID            uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	UserID        uuid.UUID  `gorm:"type:uuid;index;not null" json:"user_id"`
 	KeyHash       string     `gorm:"type:varchar(64);uniqueIndex;not null" json:"-"`
 	KeyPrefix     string     `gorm:"type:varchar(16);not null" json:"key_prefix"` // e.g. "cr_live_8f3a"

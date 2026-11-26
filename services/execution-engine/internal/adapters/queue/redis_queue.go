@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,11 +18,16 @@ const jobStateTTL = 24 * time.Hour
 
 // RedisQueueAdapter implements both ports.JobQueue and ports.StateStore using Redis.
 type RedisQueueAdapter struct {
-	client *redis.Client
+	client   *redis.Client
+	mu       sync.Mutex
+	inFlight map[string]string
 }
 
 func NewRedisQueueAdapter(client *redis.Client) *RedisQueueAdapter {
-	return &RedisQueueAdapter{client: client}
+	return &RedisQueueAdapter{
+		client:   client,
+		inFlight: make(map[string]string),
+	}
 }
 
 // -------------------------------------------------------------
@@ -48,8 +54,8 @@ func (r *RedisQueueAdapter) Enqueue(ctx context.Context, job *dto.Job) error {
 }
 
 func (r *RedisQueueAdapter) Dequeue(ctx context.Context) (*dto.Job, error) {
-	// Blocking pop with a 2-second timeout to allow graceful worker shutdown check
-	res, err := r.client.BLPop(ctx, 2*time.Second, cache.QueueJobs).Result()
+	// Atomically move from pending queue to processing list so crashes don't drop jobs.
+	rawPayload, err := r.client.BLMove(ctx, cache.QueueJobs, cache.QueueJobsProcessing, "LEFT", "RIGHT", 2*time.Second).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, nil // Queue was empty during window
@@ -57,16 +63,87 @@ func (r *RedisQueueAdapter) Dequeue(ctx context.Context) (*dto.Job, error) {
 		return nil, err
 	}
 
-	if len(res) < 2 {
-		return nil, nil
-	}
-
 	var job dto.Job
-	if err := json.Unmarshal([]byte(res[1]), &job); err != nil {
+	if err := json.Unmarshal([]byte(rawPayload), &job); err != nil {
+		// Remove poisoned payload from processing list so it doesn't stall recovery.
+		_ = r.client.LRem(ctx, cache.QueueJobsProcessing, 1, rawPayload).Err()
 		return nil, fmt.Errorf("failed to unmarshal dequeued job: %w", err)
 	}
 
+	r.mu.Lock()
+	r.inFlight[job.ID] = rawPayload
+	r.mu.Unlock()
+
 	return &job, nil
+}
+
+// Ack removes a completed or failed job payload from the processing list.
+func (r *RedisQueueAdapter) Ack(ctx context.Context, jobID string) error {
+	r.mu.Lock()
+	rawPayload, ok := r.inFlight[jobID]
+	if ok {
+		delete(r.inFlight, jobID)
+	}
+	r.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+	return r.client.LRem(ctx, cache.QueueJobsProcessing, 1, rawPayload).Err()
+}
+
+// RequeueStale scans the processing list and re-enqueues jobs orphaned by crashed workers.
+func (r *RedisQueueAdapter) RequeueStale(ctx context.Context, staleAfter time.Duration) (int, error) {
+	items, err := r.client.LRange(ctx, cache.QueueJobsProcessing, 0, -1).Result()
+	if err != nil {
+		return 0, err
+	}
+
+	requeued := 0
+	cutoff := time.Now().Add(-staleAfter)
+	for _, rawPayload := range items {
+		if r.requeueItemIfStale(ctx, rawPayload, cutoff) {
+			requeued++
+		}
+	}
+
+	return requeued, nil
+}
+
+func (r *RedisQueueAdapter) requeueItemIfStale(ctx context.Context, rawPayload string, cutoff time.Time) bool {
+	var queuedJob dto.Job
+	if err := json.Unmarshal([]byte(rawPayload), &queuedJob); err != nil {
+		_ = r.client.LRem(ctx, cache.QueueJobsProcessing, 1, rawPayload).Err()
+		return false
+	}
+
+	state, err := r.GetJob(ctx, queuedJob.ID)
+	if err != nil {
+		return false
+	}
+
+	if state == nil || isTerminalState(state.Status) {
+		_ = r.client.LRem(ctx, cache.QueueJobsProcessing, 1, rawPayload).Err()
+		return false
+	}
+
+	refTime := state.CreatedAt
+	if state.StartedAt != nil {
+		refTime = *state.StartedAt
+	}
+	if !refTime.Before(cutoff) {
+		return false
+	}
+
+	if err := r.client.RPush(ctx, cache.QueueJobs, rawPayload).Err(); err != nil {
+		return false
+	}
+	_ = r.client.LRem(ctx, cache.QueueJobsProcessing, 1, rawPayload).Err()
+	return true
+}
+
+func isTerminalState(status dto.JobStatus) bool {
+	return status == dto.StatusCompleted || status == dto.StatusFailed || status == dto.StatusCompileError
 }
 
 // -------------------------------------------------------------

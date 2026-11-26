@@ -23,7 +23,7 @@ const (
 
 // User represents an account holder in the system.
 type User struct {
-	ID           uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	ID           uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	Email        string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
 	PasswordHash string    `gorm:"type:varchar(255);not null" json:"-"`
 	Role         UserRole  `gorm:"type:varchar(32);default:'member';not null" json:"role"`

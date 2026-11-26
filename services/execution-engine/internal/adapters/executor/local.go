@@ -38,8 +38,6 @@ func getSanitizedEnv(workingDir string) []string {
 }
 
 // LocalSubprocessAdapter executes code locally inside an isolated temporary directory.
-// For compiled languages (C, C++, Go, Java), it compiles ONCE and executes the resulting
-// binary across all test cases with high speed.
 type LocalSubprocessAdapter struct{}
 
 func NewLocalSubprocessAdapter() *LocalSubprocessAdapter {
@@ -51,11 +49,11 @@ func (a *LocalSubprocessAdapter) Name() string {
 }
 
 type langConfig struct {
-	srcFile    string
-	compileCmd string
+	srcFile     string
+	compileCmd  string
 	compileArgs []string
-	runCmd     string
-	runArgs    []string
+	runCmd      string
+	runArgs     []string
 }
 
 func (a *LocalSubprocessAdapter) Execute(ctx context.Context, job *dto.Job) (*dto.ExecutionResult, error) {
@@ -70,93 +68,107 @@ func (a *LocalSubprocessAdapter) Execute(ctx context.Context, job *dto.Job) (*dt
 		return nil, err
 	}
 
-	// 1. Write user source code to file
 	srcPath := filepath.Join(tempDir, cfg.srcFile)
-	if err := os.WriteFile(srcPath, []byte(job.Code), 0644); err != nil {
+	if err := os.WriteFile(srcPath, []byte(job.Code), 0600); err != nil {
 		return nil, fmt.Errorf("failed to write source code: %w", err)
 	}
 
-	result := &dto.ExecutionResult{
-		TestResults: make([]dto.TestResult, 0),
+	compileTimeMs, compileFailure := compileSource(ctx, tempDir, cfg)
+	if compileFailure != nil {
+		return compileFailure, nil
 	}
 
-	// 2. COMPILE PHASE (if language requires compilation)
-	if cfg.compileCmd != "" {
-		compileCtx, cancel := context.WithTimeout(ctx, compileTimeout)
-		defer cancel()
+	return executeTestCases(ctx, tempDir, cfg, job, compileTimeMs)
+}
 
-		cmd := exec.Command(cfg.compileCmd, cfg.compileArgs...)
-		cmd.Dir = tempDir
-		cmd.Env = getSanitizedEnv(tempDir)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+func compileSource(ctx context.Context, tempDir string, cfg *langConfig) (int64, *dto.ExecutionResult) {
+	if cfg.compileCmd == "" {
+		return 0, nil
+	}
 
-		var compileStderr, compileStdout strings.Builder
-		cmd.Stderr = &compileStderr
-		cmd.Stdout = &compileStdout
+	compileCtx, cancel := context.WithTimeout(ctx, compileTimeout)
+	defer cancel()
 
-		compileStart := time.Now()
-		if err := cmd.Start(); err != nil {
-			result.ExitCode = 1
-			result.Stderr = capOutput(fmt.Sprintf("Failed to start compiler: %v", err))
-			return result, nil
-		}
+	cmd := exec.Command(cfg.compileCmd, cfg.compileArgs...)
+	cmd.Dir = tempDir
+	cmd.Env = getSanitizedEnv(tempDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-		compileDone := make(chan error, 1)
-		go func() {
-			compileDone <- cmd.Wait()
-		}()
+	var compileStderr, compileStdout strings.Builder
+	cmd.Stderr = &compileStderr
+	cmd.Stdout = &compileStdout
 
-		var compileErr error
-		select {
-		case <-compileCtx.Done():
-			if cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-			<-compileDone
-			result.CompilationTimeMs = time.Since(compileStart).Milliseconds()
-			result.ExitCode = 1
-			result.Stderr = capOutput("Compilation Error:\nCompilation Timed Out (exceeded 15s limit)\n" + compileStderr.String())
-			return result, nil
-		case compileErr = <-compileDone:
-			result.CompilationTimeMs = time.Since(compileStart).Milliseconds()
-		}
-
-		if compileErr != nil {
-			errOutput := compileStderr.String()
-			if errOutput == "" {
-				errOutput = compileStdout.String()
-			}
-			// Compilation failed: skip all test cases and return immediately!
-			result.ExitCode = 1
-			result.Stderr = capOutput("Compilation Error:\n" + errOutput)
-			return result, nil
+	compileStart := time.Now()
+	if err := cmd.Start(); err != nil {
+		return 0, &dto.ExecutionResult{
+			TestResults: make([]dto.TestResult, 0),
+			ExitCode:    1,
+			Stderr:      capOutput(fmt.Sprintf("Failed to start compiler: %v", err)),
 		}
 	}
 
-	// 3. EXECUTE TEST CASES PHASE (Fast loop over pre-compiled binary or interpreter)
+	compileDone := make(chan error, 1)
+	go func() {
+		compileDone <- cmd.Wait()
+	}()
+
+	select {
+	case <-compileCtx.Done():
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-compileDone
+		return 0, &dto.ExecutionResult{
+			TestResults:       make([]dto.TestResult, 0),
+			CompilationTimeMs: time.Since(compileStart).Milliseconds(),
+			ExitCode:          1,
+			Stderr:            capOutput("Compilation Error:\nCompilation Timed Out (exceeded 15s limit)\n" + compileStderr.String()),
+		}
+	case compileErr := <-compileDone:
+		elapsed := time.Since(compileStart).Milliseconds()
+		if compileErr == nil {
+			return elapsed, nil
+		}
+		errOutput := compileStderr.String()
+		if errOutput == "" {
+			errOutput = compileStdout.String()
+		}
+		return elapsed, &dto.ExecutionResult{
+			TestResults:       make([]dto.TestResult, 0),
+			CompilationTimeMs: elapsed,
+			ExitCode:          1,
+			Stderr:            capOutput("Compilation Error:\n" + errOutput),
+		}
+	}
+}
+
+func executeTestCases(ctx context.Context, tempDir string, cfg *langConfig, job *dto.Job, compileTimeMs int64) (*dto.ExecutionResult, error) {
 	timeout := time.Duration(job.TimeLimitMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 3000 * time.Millisecond
 	}
 
-	// Case A: No test cases provided — run once with no stdin
 	if len(job.TestCases) == 0 {
 		singleRes, err := runSingleTestCase(ctx, tempDir, cfg.runCmd, cfg.runArgs, "", timeout)
 		if err != nil {
 			return nil, err
 		}
-		singleRes.CompilationTimeMs = result.CompilationTimeMs
+		singleRes.CompilationTimeMs = compileTimeMs
 		return singleRes, nil
 	}
 
-	// Case B: Batch test case execution
-	var totalExecutionTime int64
+	result := &dto.ExecutionResult{
+		CompilationTimeMs: compileTimeMs,
+		TestResults:       make([]dto.TestResult, 0, len(job.TestCases)),
+		MemoryUsedKB:      16384,
+	}
+
 	for _, tc := range job.TestCases {
 		res, err := runSingleTestCase(ctx, tempDir, cfg.runCmd, cfg.runArgs, tc.Input, timeout)
 		if err != nil {
 			return nil, err
 		}
-		totalExecutionTime += res.TimeTakenMs
+		result.TimeTakenMs += res.TimeTakenMs
 
 		trimmedActual := strings.TrimRight(res.Stdout, "\r\n")
 		trimmedExpected := strings.TrimRight(tc.ExpectedOutput, "\r\n")
@@ -170,14 +182,11 @@ func (a *LocalSubprocessAdapter) Execute(ctx context.Context, job *dto.Job) (*dt
 			TimeTakenMs:    res.TimeTakenMs,
 		})
 
-		// Track last / first failing output
 		result.Stdout = res.Stdout
 		result.Stderr = res.Stderr
 		result.ExitCode = res.ExitCode
 	}
 
-	result.TimeTakenMs = totalExecutionTime
-	result.MemoryUsedKB = 16384 // Estimated baseline memory
 	return result, nil
 }
 
@@ -185,14 +194,12 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 	binaryPath := filepath.Join(tempDir, "solution")
 
 	switch strings.ToLower(language) {
-	// --- Compiled Languages (Compile Once, Run N times) ---
 	case "c":
 		return &langConfig{
 			srcFile:     "solution.c",
 			compileCmd:  "gcc",
 			compileArgs: []string{"-O2", "-o", binaryPath, filepath.Join(tempDir, "solution.c")},
 			runCmd:      binaryPath,
-			runArgs:     []string{},
 		}, nil
 
 	case "cpp", "c++", "cxx", "cc":
@@ -201,7 +208,6 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 			compileCmd:  "g++",
 			compileArgs: []string{"-O2", "-std=c++20", "-o", binaryPath, filepath.Join(tempDir, "solution.cpp")},
 			runCmd:      binaryPath,
-			runArgs:     []string{},
 		}, nil
 
 	case "go", "golang":
@@ -210,11 +216,9 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 			compileCmd:  "go",
 			compileArgs: []string{"build", "-o", binaryPath, filepath.Join(tempDir, "solution.go")},
 			runCmd:      binaryPath,
-			runArgs:     []string{},
 		}, nil
 
 	case "java":
-		// Java public class must match file name: Solution.java
 		return &langConfig{
 			srcFile:     "Solution.java",
 			compileCmd:  "javac",
@@ -223,7 +227,6 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 			runArgs:     []string{"-cp", tempDir, "Solution"},
 		}, nil
 
-	// --- Interpreted / JIT Languages (Run directly) ---
 	case "python", "py", "python3":
 		return &langConfig{
 			srcFile: "solution.py",
@@ -239,21 +242,17 @@ func prepareLanguageConfig(language, tempDir string) (*langConfig, error) {
 		}, nil
 
 	case "typescript", "ts":
-		// Check if bun is available (blazing fast TS runtime)
-		tsRunner := "bun"
-		if _, err := exec.LookPath("bun"); err != nil {
-			// Fallback to node with stripped types
-			tsRunner = "node"
+		if _, err := exec.LookPath("bun"); err == nil {
 			return &langConfig{
 				srcFile: "solution.ts",
-				runCmd:  tsRunner,
-				runArgs: []string{"--experimental-strip-types", filepath.Join(tempDir, "solution.ts")},
+				runCmd:  "bun",
+				runArgs: []string{"run", filepath.Join(tempDir, "solution.ts")},
 			}, nil
 		}
 		return &langConfig{
 			srcFile: "solution.ts",
-			runCmd:  tsRunner,
-			runArgs: []string{"run", filepath.Join(tempDir, "solution.ts")},
+			runCmd:  "node",
+			runArgs: []string{"--experimental-strip-types", filepath.Join(tempDir, "solution.ts")},
 		}, nil
 
 	default:
@@ -295,35 +294,31 @@ func runSingleTestCase(ctx context.Context, workingDir, cmdName string, args []s
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		<-waitDone
-		duration := time.Since(start).Milliseconds()
 		return &dto.ExecutionResult{
 			Stdout:      capOutput(stdoutBuf.String()),
 			Stderr:      "Time Limit Exceeded\n" + capOutput(stderrBuf.String()),
 			ExitCode:    124,
-			TimeTakenMs: duration,
+			TimeTakenMs: time.Since(start).Milliseconds(),
 		}, nil
 	case waitErr = <-waitDone:
 	}
 
-	duration := time.Since(start).Milliseconds()
-	stdoutStr := capOutput(stdoutBuf.String())
-	stderrStr := capOutput(stderrBuf.String())
-
-	exitCode := 0
-	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
-
 	return &dto.ExecutionResult{
-		Stdout:      stdoutStr,
-		Stderr:      stderrStr,
-		ExitCode:    exitCode,
-		TimeTakenMs: duration,
+		Stdout:      capOutput(stdoutBuf.String()),
+		Stderr:      capOutput(stderrBuf.String()),
+		ExitCode:    extractExitCode(waitErr),
+		TimeTakenMs: time.Since(start).Milliseconds(),
 	}, nil
+}
+
+func extractExitCode(waitErr error) int {
+	if waitErr == nil {
+		return 0
+	}
+	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+		return exitErr.ExitCode()
+	}
+	return 1
 }
 
 func capOutput(s string) string {

@@ -4,158 +4,167 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/requestid"
 	"github.com/google/uuid"
 )
 
 // Response is the unified generic API envelope returned for all JSON endpoints.
-// Every response contains request_id, success flag, and optionally data or error.
 type Response[T any] struct {
 	RequestID string `json:"request_id"`
 	Success   bool   `json:"success"`
+	Message   string `json:"message,omitempty"`
 	Data      T      `json:"data,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Timestamp string `json:"timestamp"`
 }
 
 // Envelope is an untyped API response envelope for arbitrary payloads.
 type Envelope struct {
 	RequestID string      `json:"request_id"`
 	Success   bool        `json:"success"`
+	Message   string      `json:"message,omitempty"`
 	Data      interface{} `json:"data,omitempty"`
 	Error     string      `json:"error,omitempty"`
+	Timestamp string      `json:"timestamp"`
 }
 
-// GetRequestID extracts or generates the request ID for the current context.
-func GetRequestID(c *fiber.Ctx) string {
+// GetRequestID extracts or generates the request ID for the current Fiber v3 context.
+func GetRequestID(c fiber.Ctx) string {
 	if c == nil {
 		return uuid.New().String()
 	}
 
-	// 1. Check locals ("requestid") populated by fiber requestid middleware
+	if id := requestid.FromContext(c); id != "" {
+		return id
+	}
+
 	if id, ok := c.Locals("requestid").(string); ok && id != "" {
 		return id
 	}
 
-	// 2. Check X-Request-ID response header
-	if id := string(c.Response().Header.Peek(fiber.HeaderXRequestID)); id != "" {
+	if id := c.GetRespHeader(fiber.HeaderXRequestID); id != "" {
 		c.Locals("requestid", id)
 		return id
 	}
 
-	// 3. Check X-Request-ID request header
 	if id := c.Get(fiber.HeaderXRequestID); id != "" {
-		c.Response().Header.Set(fiber.HeaderXRequestID, id)
+		c.Set(fiber.HeaderXRequestID, id)
 		c.Locals("requestid", id)
 		return id
 	}
 
-	// 4. Generate a fresh UUID and attach to response header
 	newID := uuid.New().String()
 	c.Locals("requestid", newID)
-	c.Response().Header.Set(fiber.HeaderXRequestID, newID)
+	c.Set(fiber.HeaderXRequestID, newID)
 	return newID
 }
 
-// Success returns a 200 OK standard envelope with data.
-func Success(c *fiber.Ctx, data interface{}) error {
-	reqID := GetRequestID(c)
-	return c.Status(fiber.StatusOK).JSON(Envelope{
-		RequestID: reqID,
+// SendSuccess writes a standardized JSON success envelope (biolynq-style).
+func SendSuccess(c fiber.Ctx, status int, message string, data interface{}) error {
+	return c.Status(status).JSON(Envelope{
+		RequestID: GetRequestID(c),
 		Success:   true,
+		Message:   message,
 		Data:      data,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// SendError writes a standardized JSON error envelope (biolynq-style).
+func SendError(c fiber.Ctx, status int, errMessage string) error {
+	return c.Status(status).JSON(Envelope{
+		RequestID: GetRequestID(c),
+		Success:   false,
+		Message:   errMessage,
+		Error:     errMessage,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// Success returns a 200 OK standard envelope with data.
+func Success(c fiber.Ctx, data interface{}) error {
+	return SendSuccess(c, fiber.StatusOK, "", data)
 }
 
 // Created returns a 201 Created standard envelope with data.
-func Created(c *fiber.Ctx, data interface{}) error {
-	reqID := GetRequestID(c)
-	return c.Status(fiber.StatusCreated).JSON(Envelope{
-		RequestID: reqID,
-		Success:   true,
-		Data:      data,
-	})
+func Created(c fiber.Ctx, data interface{}) error {
+	return SendSuccess(c, fiber.StatusCreated, "", data)
 }
 
 // Accepted returns a 202 Accepted standard envelope with data.
-func Accepted(c *fiber.Ctx, data interface{}) error {
-	reqID := GetRequestID(c)
-	return c.Status(fiber.StatusAccepted).JSON(Envelope{
-		RequestID: reqID,
-		Success:   true,
-		Data:      data,
-	})
+func Accepted(c fiber.Ctx, data interface{}) error {
+	return SendSuccess(c, fiber.StatusAccepted, "", data)
 }
 
 // JSON returns a custom status code standard envelope with data.
-func JSON(c *fiber.Ctx, status int, data interface{}) error {
-	reqID := GetRequestID(c)
+func JSON(c fiber.Ctx, status int, data interface{}) error {
+	if status >= 200 && status < 300 {
+		return SendSuccess(c, status, "", data)
+	}
 	return c.Status(status).JSON(Envelope{
-		RequestID: reqID,
-		Success:   status >= 200 && status < 300,
+		RequestID: GetRequestID(c),
+		Success:   false,
 		Data:      data,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 // Error returns a standardized error response with the given status code and message.
-func Error(c *fiber.Ctx, status int, errMessage string) error {
-	reqID := GetRequestID(c)
-	return c.Status(status).JSON(Envelope{
-		RequestID: reqID,
-		Success:   false,
-		Error:     errMessage,
-	})
+func Error(c fiber.Ctx, status int, errMessage string) error {
+	return SendError(c, status, errMessage)
 }
 
 // BadRequest returns 400 Bad Request.
-func BadRequest(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusBadRequest, errMessage)
+func BadRequest(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusBadRequest, errMessage)
 }
 
 // Unauthorized returns 401 Unauthorized.
-func Unauthorized(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusUnauthorized, errMessage)
+func Unauthorized(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusUnauthorized, errMessage)
 }
 
 // Forbidden returns 403 Forbidden.
-func Forbidden(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusForbidden, errMessage)
+func Forbidden(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusForbidden, errMessage)
 }
 
 // NotFound returns 404 Not Found.
-func NotFound(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusNotFound, errMessage)
+func NotFound(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusNotFound, errMessage)
 }
 
 // TooManyRequests returns 429 Too Many Requests.
-func TooManyRequests(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusTooManyRequests, errMessage)
+func TooManyRequests(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusTooManyRequests, errMessage)
 }
 
 // InternalServerError returns 500 Internal Server Error.
-func InternalServerError(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusInternalServerError, errMessage)
+func InternalServerError(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusInternalServerError, errMessage)
 }
 
 // BadGateway returns 502 Bad Gateway.
-func BadGateway(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusBadGateway, errMessage)
+func BadGateway(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusBadGateway, errMessage)
 }
 
 // GatewayTimeout returns 504 Gateway Timeout.
-func GatewayTimeout(c *fiber.Ctx, errMessage string) error {
-	return Error(c, fiber.StatusGatewayTimeout, errMessage)
+func GatewayTimeout(c fiber.Ctx, errMessage string) error {
+	return SendError(c, fiber.StatusGatewayTimeout, errMessage)
 }
 
-// FiberErrorHandler is a global Fiber error handler that formats any unhandled route
-// or framework error (e.g. 404 Route Not Found, 405 Method Not Allowed) into the standardized envelope.
-func FiberErrorHandler(c *fiber.Ctx, err error) error {
+// FiberErrorHandler formats any unhandled route or validation error into the standardized envelope.
+func FiberErrorHandler(c fiber.Ctx, err error) error {
 	code := fiber.StatusInternalServerError
 	var e *fiber.Error
 	if errors.As(err, &e) {
 		code = e.Code
 	}
-	return Error(c, code, err.Error())
+	return SendError(c, code, err.Error())
 }
 
 // Decode extracts a generic Response[T] from an io.Reader.

@@ -14,6 +14,8 @@ import (
 const (
 	// QueueJobs is the Redis list/stream for pending execution jobs.
 	QueueJobs = "queue:jobs"
+	// QueueJobsProcessing holds in-flight jobs claimed by workers until acknowledged.
+	QueueJobsProcessing = "queue:jobs:processing"
 )
 
 // Cache provides high-performance, reusable Redis caching functions:
@@ -37,15 +39,32 @@ func (c *Cache) Client() *redis.Client {
 	return c.client
 }
 
-// Key dynamically formats a colon-delimited Redis key from arbitrary parts.
+var keySegmentReplacer = strings.NewReplacer(
+	":", "_",
+	"*", "_",
+	"?", "_",
+	"[", "_",
+	"]", "_",
+	" ", "_",
+	"\t", "_",
+	"\r", "_",
+	"\n", "_",
+)
+
+func sanitizeKeySegment(s string) string {
+	return keySegmentReplacer.Replace(s)
+}
+
+// Key dynamically formats a colon-delimited Redis key from arbitrary parts,
+// sanitizing delimiters and glob characters in each segment to prevent key collisions.
 // Example: Key("dashboard", "stats", userID) -> "dashboard:stats:<userID>"
 func Key(namespace string, parts ...interface{}) string {
 	segments := make([]string, 0, len(parts)+1)
 	if namespace != "" {
-		segments = append(segments, namespace)
+		segments = append(segments, sanitizeKeySegment(namespace))
 	}
 	for _, p := range parts {
-		segments = append(segments, fmt.Sprintf("%v", p))
+		segments = append(segments, sanitizeKeySegment(fmt.Sprintf("%v", p)))
 	}
 	return strings.Join(segments, ":")
 }
@@ -178,10 +197,8 @@ func (c *Cache) RevokePattern(ctx context.Context, pattern string) error {
 			return fmt.Errorf("failed scanning pattern %s: %w", pattern, err)
 		}
 
-		if len(keys) > 0 {
-			if err := c.client.Del(ctx, keys...).Err(); err != nil {
-				return fmt.Errorf("failed deleting keys matching %s: %w", pattern, err)
-			}
+		if err := c.Revoke(ctx, keys...); err != nil {
+			return fmt.Errorf("failed deleting keys matching %s: %w", pattern, err)
 		}
 
 		cursor = nextCursor
@@ -290,4 +307,108 @@ func FetchPaginated[T any](ctx context.Context, c *Cache, key string, ttl time.D
 		return zero, 0, err
 	}
 	return res.Items, res.Total, nil
+}
+
+// -----------------------------------------------------------------------------
+// Type-Safe Generic TypedCache[T] Registry Wrapper (biolynq-style)
+// -----------------------------------------------------------------------------
+
+// TypedCache provides a strongly-typed, nil-safe Redis cache wrapper for a specific domain type T.
+type TypedCache[T any] struct {
+	rdb *redis.Client
+}
+
+// NewTypedCache creates a new TypedCache[T] bound to a Redis client.
+// Passing nil returns a safe no-op cache instance.
+func NewTypedCache[T any](rdb *redis.Client) *TypedCache[T] {
+	return &TypedCache[T]{rdb: rdb}
+}
+
+// Get retrieves and unmarshals a cached value of type T.
+func (c *TypedCache[T]) Get(ctx context.Context, key string) (*T, error) {
+	if c == nil || c.rdb == nil || key == "" {
+		return nil, redis.Nil
+	}
+	val, err := c.rdb.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+	var dest T
+	if err := json.Unmarshal([]byte(val), &dest); err != nil {
+		return nil, err
+	}
+	return &dest, nil
+}
+
+// Set stores a typed value in Redis with the specified TTL.
+func (c *TypedCache[T]) Set(ctx context.Context, key string, value *T, expiration time.Duration) error {
+	if c == nil || c.rdb == nil || key == "" {
+		return nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return c.rdb.Set(ctx, key, data, expiration).Err()
+}
+
+// Delete removes exact cache keys synchronously.
+func (c *TypedCache[T]) Delete(ctx context.Context, keys ...string) error {
+	if c == nil || c.rdb == nil || len(keys) == 0 {
+		return nil
+	}
+	return c.rdb.Del(ctx, keys...).Err()
+}
+
+// InvalidateAsync deletes one or more exact keys asynchronously without blocking callers.
+func (c *TypedCache[T]) InvalidateAsync(keys ...string) {
+	if c == nil || c.rdb == nil || len(keys) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = c.rdb.Del(ctx, keys...).Err()
+	}()
+}
+
+// InvalidatePatternAsync removes keys matching a glob pattern asynchronously.
+func (c *TypedCache[T]) InvalidatePatternAsync(pattern string) {
+	if c == nil || c.rdb == nil || pattern == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = New(c.rdb).RevokePattern(ctx, pattern)
+	}()
+}
+
+// Fetch executes cache-aside retrieval for T, caching misses asynchronously so hot reads stay non-blocking.
+func (c *TypedCache[T]) Fetch(
+	ctx context.Context,
+	key string,
+	expiration time.Duration,
+	dbQuery func() (*T, error),
+) (*T, error) {
+	if c != nil && c.rdb != nil && key != "" {
+		if result, err := c.Get(ctx, key); err == nil {
+			return result, nil
+		}
+	}
+
+	result, err := dbQuery()
+	if err != nil {
+		return nil, err
+	}
+
+	if c != nil && c.rdb != nil && key != "" && result != nil {
+		go func(val *T) {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = c.Set(bgCtx, key, val, expiration)
+		}(result)
+	}
+
+	return result, nil
 }

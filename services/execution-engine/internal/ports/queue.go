@@ -6,10 +6,11 @@ import (
 	"code-runner/shared/dto"
 )
 
-// JobQueue defines how jobs are enqueued and dequeued asynchronously.
+// JobQueue defines how jobs are enqueued, dequeued, and acknowledged asynchronously.
 type JobQueue interface {
 	Enqueue(ctx context.Context, job *dto.Job) error
 	Dequeue(ctx context.Context) (*dto.Job, error)
+	Ack(ctx context.Context, jobID string) error
 }
 
 // StateStore defines how active execution states are tracked in-flight.

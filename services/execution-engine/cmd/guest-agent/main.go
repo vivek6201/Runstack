@@ -80,15 +80,7 @@ func handleConnection(conn net.Conn) {
 }
 
 func executeJob(job *dto.Job) *dto.ExecutionResult {
-	// Clean workspace between runs (clean contents without removing mount point)
-	entries, err := os.ReadDir(workspaceDir)
-	if err == nil {
-		for _, e := range entries {
-			_ = os.RemoveAll(filepath.Join(workspaceDir, e.Name()))
-		}
-	} else {
-		_ = os.MkdirAll(workspaceDir, 0777)
-	}
+	cleanWorkspace()
 
 	cfg, err := getLanguageConfig(job.Language, workspaceDir)
 	if err != nil {
@@ -98,47 +90,68 @@ func executeJob(job *dto.Job) *dto.ExecutionResult {
 		}
 	}
 
-	// 1. Write source file
 	srcPath := filepath.Join(workspaceDir, cfg.srcFile)
-	if err := os.WriteFile(srcPath, []byte(job.Code), 0644); err != nil {
+	if err := os.WriteFile(srcPath, []byte(job.Code), 0600); err != nil {
 		return &dto.ExecutionResult{
 			ExitCode: 1,
 			Stderr:   fmt.Sprintf("Failed to write source file: %v", err),
 		}
 	}
 
-	result := &dto.ExecutionResult{
-		TestResults: make([]dto.TestResult, 0),
+	compileTimeMs, compileFailure := compileInVM(cfg)
+	if compileFailure != nil {
+		return compileFailure
 	}
 
-	// 2. COMPILE PHASE (once for compiled languages)
-	if cfg.compileCmd != "" {
-		compileCtx, cancel := context.WithTimeout(context.Background(), compileTimeout)
-		defer cancel()
+	return executeTestCasesInVM(cfg, job, compileTimeMs)
+}
 
-		cmd := exec.CommandContext(compileCtx, cfg.compileCmd, cfg.compileArgs...)
-		cmd.Dir = workspaceDir
+func cleanWorkspace() {
+	entries, err := os.ReadDir(workspaceDir)
+	if err != nil {
+		_ = os.MkdirAll(workspaceDir, 0777)
+		return
+	}
+	for _, e := range entries {
+		_ = os.RemoveAll(filepath.Join(workspaceDir, e.Name()))
+	}
+}
 
-		var stderrBuf, stdoutBuf strings.Builder
-		cmd.Stderr = &stderrBuf
-		cmd.Stdout = &stdoutBuf
-
-		start := time.Now()
-		err := cmd.Run()
-		result.CompilationTimeMs = time.Since(start).Milliseconds()
-
-		if err != nil {
-			errOutput := stderrBuf.String()
-			if errOutput == "" {
-				errOutput = stdoutBuf.String()
-			}
-			result.ExitCode = 1
-			result.Stderr = capOutput("Compilation Error:\n" + errOutput)
-			return result // Skip test cases
-		}
+func compileInVM(cfg *vmConfig) (int64, *dto.ExecutionResult) {
+	if cfg.compileCmd == "" {
+		return 0, nil
 	}
 
-	// 3. EXECUTE TEST CASES PHASE
+	compileCtx, cancel := context.WithTimeout(context.Background(), compileTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(compileCtx, cfg.compileCmd, cfg.compileArgs...)
+	cmd.Dir = workspaceDir
+
+	var stderrBuf, stdoutBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+	cmd.Stdout = &stdoutBuf
+
+	start := time.Now()
+	err := cmd.Run()
+	elapsed := time.Since(start).Milliseconds()
+	if err == nil {
+		return elapsed, nil
+	}
+
+	errOutput := stderrBuf.String()
+	if errOutput == "" {
+		errOutput = stdoutBuf.String()
+	}
+	return elapsed, &dto.ExecutionResult{
+		TestResults:       make([]dto.TestResult, 0),
+		CompilationTimeMs: elapsed,
+		ExitCode:          1,
+		Stderr:            capOutput("Compilation Error:\n" + errOutput),
+	}
+}
+
+func executeTestCasesInVM(cfg *vmConfig, job *dto.Job, compileTimeMs int64) *dto.ExecutionResult {
 	timeout := time.Duration(job.TimeLimitMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 3000 * time.Millisecond
@@ -146,14 +159,18 @@ func executeJob(job *dto.Job) *dto.ExecutionResult {
 
 	if len(job.TestCases) == 0 {
 		singleRes := runSingle(workspaceDir, cfg.runCmd, cfg.runArgs, "", timeout)
-		singleRes.CompilationTimeMs = result.CompilationTimeMs
+		singleRes.CompilationTimeMs = compileTimeMs
 		return singleRes
 	}
 
-	var totalExecutionTime int64
+	result := &dto.ExecutionResult{
+		CompilationTimeMs: compileTimeMs,
+		TestResults:       make([]dto.TestResult, 0, len(job.TestCases)),
+	}
+
 	for _, tc := range job.TestCases {
 		res := runSingle(workspaceDir, cfg.runCmd, cfg.runArgs, tc.Input, timeout)
-		totalExecutionTime += res.TimeTakenMs
+		result.TimeTakenMs += res.TimeTakenMs
 
 		trimmedActual := strings.TrimRight(res.Stdout, "\r\n")
 		trimmedExpected := strings.TrimRight(tc.ExpectedOutput, "\r\n")
@@ -172,7 +189,6 @@ func executeJob(job *dto.Job) *dto.ExecutionResult {
 		result.ExitCode = res.ExitCode
 	}
 
-	result.TimeTakenMs = totalExecutionTime
 	result.MemoryUsedKB = readCgroupPeakMemory()
 	return result
 }

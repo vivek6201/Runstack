@@ -188,3 +188,30 @@ func TestCache_FetchPaginatedWrapper(t *testing.T) {
 		t.Errorf("expected dbList to be called once, got %d", callCount)
 	}
 }
+
+func TestCache_KeySanitization(t *testing.T) {
+	got := cache.Key("dashboard", "submissions", "user-1", "list", 1, 20, "COMPLETED:*:injected", "py?*[0]\n")
+	want := "dashboard:submissions:user-1:list:1:20:COMPLETED___injected:py___0__"
+	if got != want {
+		t.Errorf("cache.Key() sanitization mismatch: got %q, want %q", got, want)
+	}
+}
+
+func TestTypedCache_NilSafetyAndFetch(t *testing.T) {
+	type Sample struct {
+		Name string `json:"name"`
+	}
+	tc := cache.NewTypedCache[Sample](nil)
+	res, err := tc.Fetch(context.Background(), "sample:1", time.Minute, func() (*Sample, error) {
+		return &Sample{Name: "runstack"}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil || res.Name != "runstack" {
+		t.Errorf("unexpected TypedCache result: %+v", res)
+	}
+	// Async invalidation on nil client must not panic
+	tc.InvalidateAsync("sample:1")
+	tc.InvalidatePatternAsync("sample:*")
+}

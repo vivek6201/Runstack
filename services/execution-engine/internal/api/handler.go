@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
 	"code-runner/execution-engine/internal/ports"
@@ -13,26 +13,31 @@ import (
 	"code-runner/shared/response"
 )
 
+type IHandler interface {
+	SubmitHandler(c fiber.Ctx) error
+	StatusHandler(c fiber.Ctx) error
+	HealthHandler(c fiber.Ctx) error
+}
+
 type Handler struct {
 	queue ports.JobQueue
 	store ports.StateStore
 }
 
-func NewHandler(queue ports.JobQueue, store ports.StateStore) *Handler {
+func NewHandler(queue ports.JobQueue, store ports.StateStore) IHandler {
 	return &Handler{
 		queue: queue,
 		store: store,
 	}
 }
 
-// Submit handles POST /v1/submit
-func (h *Handler) Submit(c *fiber.Ctx) error {
+// SubmitHandler handles POST /v1/submit.
+func (h *Handler) SubmitHandler(c fiber.Ctx) error {
 	var req dto.SubmitRequest
-	if err := c.BodyParser(&req); err != nil {
-		return response.BadRequest(c, "invalid JSON payload")
+	if err := c.Bind().JSON(&req); err != nil {
+		return response.BadRequest(c, "invalid JSON payload: language and code are required")
 	}
 
-	// Basic validation
 	if strings.TrimSpace(req.Code) == "" {
 		return response.BadRequest(c, "code cannot be empty")
 	}
@@ -40,27 +45,8 @@ func (h *Handler) Submit(c *fiber.Ctx) error {
 		return response.BadRequest(c, "language is required")
 	}
 
-	// Set reasonable default limits if not specified
-	if req.TimeLimitMs <= 0 {
-		req.TimeLimitMs = 3000 // 3 seconds default
-	} else if req.TimeLimitMs > 15000 {
-		req.TimeLimitMs = 15000 // 15 seconds max
-	}
-
-	if req.MemoryLimitMB <= 0 {
-		req.MemoryLimitMB = 128
-	}
-
-	// Retrieve auth metadata from context
-	var userID, apiKeyID string
-	if authMeta, ok := c.Locals("auth").(*models.APIKeyCachedMetadata); ok && authMeta != nil {
-		if authMeta.UserID != uuid.Nil {
-			userID = authMeta.UserID.String()
-		}
-		if authMeta.APIKeyID != uuid.Nil {
-			apiKeyID = authMeta.APIKeyID.String()
-		}
-	}
+	applyDefaultBounds(&req)
+	userID, apiKeyID := extractAuthIdentifiers(c)
 
 	jobID := uuid.New().String()
 	job := &dto.Job{
@@ -76,7 +62,6 @@ func (h *Handler) Submit(c *fiber.Ctx) error {
 		CreatedAt:     time.Now(),
 	}
 
-	// Push job into the queue
 	if err := h.queue.Enqueue(c.Context(), job); err != nil {
 		return response.InternalServerError(c, "failed to enqueue job")
 	}
@@ -87,8 +72,8 @@ func (h *Handler) Submit(c *fiber.Ctx) error {
 	})
 }
 
-// Status handles GET /v1/status/:id
-func (h *Handler) Status(c *fiber.Ctx) error {
+// StatusHandler handles GET /v1/status/:id.
+func (h *Handler) StatusHandler(c fiber.Ctx) error {
 	jobID := c.Params("id")
 	if jobID == "" {
 		return response.BadRequest(c, "missing job id")
@@ -98,32 +83,59 @@ func (h *Handler) Status(c *fiber.Ctx) error {
 	if err != nil {
 		return response.InternalServerError(c, "failed to query job state")
 	}
-
 	if job == nil {
 		return response.NotFound(c, "job not found or expired")
 	}
 
-	// IDOR check: If the job belongs to a registered user, ensure requesting caller owns it
-	if job.UserID != "" {
-		if authMeta, ok := c.Locals("auth").(*models.APIKeyCachedMetadata); ok && authMeta != nil {
-			if authMeta.UserID == uuid.Nil || job.UserID != authMeta.UserID.String() {
-				return response.Forbidden(c, "access denied: you do not have permission to view this job")
-			}
-		}
+	if !canAccessJob(c, job) {
+		return response.Forbidden(c, "access denied: you do not have permission to view this job")
 	}
 
-	// Never use public cache-control for user execution code and results:
-	// Use private, no-cache so shared CDNs and reverse proxies never store customer code/results.
 	c.Set("Cache-Control", "private, no-cache, no-store, must-revalidate")
-
 	return response.Success(c, job)
 }
 
-// Health handles GET /health
-func (h *Handler) Health(c *fiber.Ctx) error {
+// HealthHandler handles GET /health.
+func (h *Handler) HealthHandler(c fiber.Ctx) error {
 	return response.Success(c, fiber.Map{
 		"status":    "healthy",
 		"service":   "execution-engine",
 		"timestamp": time.Now().UTC(),
 	})
+}
+
+func applyDefaultBounds(req *dto.SubmitRequest) {
+	if req.TimeLimitMs <= 0 {
+		req.TimeLimitMs = 3000
+	} else if req.TimeLimitMs > 15000 {
+		req.TimeLimitMs = 15000
+	}
+	if req.MemoryLimitMB <= 0 {
+		req.MemoryLimitMB = 128
+	}
+}
+
+func extractAuthIdentifiers(c fiber.Ctx) (userID, apiKeyID string) {
+	authMeta, ok := c.Locals("auth").(*models.APIKeyCachedMetadata)
+	if !ok || authMeta == nil {
+		return "", ""
+	}
+	if authMeta.UserID != uuid.Nil {
+		userID = authMeta.UserID.String()
+	}
+	if authMeta.APIKeyID != uuid.Nil {
+		apiKeyID = authMeta.APIKeyID.String()
+	}
+	return userID, apiKeyID
+}
+
+func canAccessJob(c fiber.Ctx, job *dto.Job) bool {
+	if job.UserID == "" {
+		return true
+	}
+	authMeta, ok := c.Locals("auth").(*models.APIKeyCachedMetadata)
+	if !ok || authMeta == nil {
+		return true
+	}
+	return authMeta.UserID != uuid.Nil && job.UserID == authMeta.UserID.String()
 }

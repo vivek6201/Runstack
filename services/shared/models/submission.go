@@ -52,7 +52,7 @@ func (j *JSONBTestResults) Scan(value interface{}) error {
 
 // Submission stores permanent execution records in PostgreSQL.
 type Submission struct {
-	ID        uuid.UUID        `gorm:"type:uuid;primaryKey" json:"id"`
+	ID        uuid.UUID        `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	UserID    uuid.UUID        `gorm:"type:uuid;index;not null" json:"user_id"`
 	APIKeyID  *uuid.UUID       `gorm:"type:uuid;index" json:"api_key_id,omitempty"`
 	Language  string           `gorm:"type:varchar(32);not null;index" json:"language"`

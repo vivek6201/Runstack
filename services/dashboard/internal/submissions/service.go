@@ -2,110 +2,139 @@ package submissions
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
 
-	subRepo "code-runner/dashboard/internal/repository/submission"
 	"code-runner/shared/cache"
-	"code-runner/shared/dto"
+	"code-runner/shared/models"
 )
 
-var (
-	ErrSubmissionNotFound = errors.New("submission not found")
-)
-
-type Service struct {
-	repo  subRepo.Repository
-	cache *cache.Cache
+type ISubmissionsService interface {
+	List(ctx context.Context, userID uuid.UUID, query SubmissionListQuery) ([]SubmissionSummaryResponse, int64, error)
+	Get(ctx context.Context, userID, submissionID uuid.UUID) (*SubmissionDetailResponse, error)
 }
 
-func NewService(repo subRepo.Repository, cache *cache.Cache) *Service {
-	return &Service{
-		repo:  repo,
-		cache: cache,
+type SubmissionsService struct {
+	repo   ISubmissionsRepository
+	caches *Caches
+}
+
+func NewSubmissionsService(repo ISubmissionsRepository, caches *Caches) ISubmissionsService {
+	return &SubmissionsService{
+		repo:   repo,
+		caches: caches,
 	}
 }
 
-// List retrieves paginated submissions, hitting cache first then querying DB on miss.
-func (s *Service) List(ctx context.Context, userID uuid.UUID, query dto.SubmissionListQuery) ([]dto.SubmissionSummaryResponse, int64, error) {
-	page := query.Page
-	if page < 1 {
-		page = 1
+func (s *SubmissionsService) List(ctx context.Context, userID uuid.UUID, query SubmissionListQuery) ([]SubmissionSummaryResponse, int64, error) {
+	page, limit, offset := normalizePagination(query.Page, query.Limit)
+	load := func() (*PaginatedSubmissions, error) {
+		return s.loadPaginatedFromDB(ctx, userID, query, limit, offset)
 	}
-	limit := query.Limit
-	if limit < 1 || limit > 100 {
-		limit = 20
-	}
-	offset := (page - 1) * limit
 
-	cacheKey := cache.Key("dashboard", "submissions", userID.String(), "list", page, limit, query.Status, query.Language)
-
-	return cache.FetchPaginated(ctx, s.cache, cacheKey, 30*time.Second, func() ([]dto.SubmissionSummaryResponse, int64, error) {
-		subs, total, err := s.repo.List(ctx, userID, query.Status, query.Language, limit, offset)
+	if s.caches == nil || s.caches.List == nil {
+		res, err := load()
 		if err != nil {
 			return nil, 0, err
 		}
+		return res.Items, res.Total, nil
+	}
 
-		results := make([]dto.SubmissionSummaryResponse, len(subs))
-		for i, sub := range subs {
-			passed := 0
-			for _, tc := range sub.TestResults {
-				if tc.Passed {
-					passed++
-				}
-			}
-
-			results[i] = dto.SubmissionSummaryResponse{
-				ID:              sub.ID,
-				Language:        sub.Language,
-				Status:          sub.Status,
-				ExitCode:        sub.ExitCode,
-				TimeTakenMs:     sub.TimeTakenMs,
-				MemoryUsedKB:    sub.MemoryUsedKB,
-				TotalTestCases:  len(sub.TestResults),
-				PassedTestCases: passed,
-				CreatedAt:       sub.CreatedAt,
-				CompletedAt:     sub.CompletedAt,
-			}
-		}
-
-		return results, total, nil
-	})
+	cacheKey := cache.Key("dashboard", "submissions", userID.String(), "list", page, limit, query.Status, query.Language)
+	res, err := s.caches.List.Fetch(ctx, cacheKey, 30*time.Second, load)
+	if err != nil {
+		return nil, 0, err
+	}
+	return res.Items, res.Total, nil
 }
 
-// Get retrieves a single submission by ID, hitting cache first then querying DB on miss.
-func (s *Service) Get(ctx context.Context, userID, submissionID uuid.UUID) (*dto.SubmissionDetailResponse, error) {
-	cacheKey := cache.Key("dashboard", "submissions", userID.String(), "detail", submissionID.String())
-
-	return cache.Fetch(ctx, s.cache, cacheKey, 1*time.Hour, func() (*dto.SubmissionDetailResponse, error) {
+func (s *SubmissionsService) Get(ctx context.Context, userID, submissionID uuid.UUID) (*SubmissionDetailResponse, error) {
+	load := func() (*SubmissionDetailResponse, error) {
 		sub, err := s.repo.FindByID(ctx, userID, submissionID)
 		if err != nil {
-			if errors.Is(err, subRepo.ErrSubmissionNotFound) {
-				return nil, ErrSubmissionNotFound
-			}
 			return nil, err
 		}
+		return mapSubmissionDetail(sub), nil
+	}
 
-		return &dto.SubmissionDetailResponse{
-			ID:            sub.ID,
-			UserID:        sub.UserID,
-			APIKeyID:      sub.APIKeyID,
-			Language:      sub.Language,
-			Code:          sub.Code,
-			Status:        sub.Status,
-			TimeLimitMs:   sub.TimeLimitMs,
-			MemoryLimitMB: sub.MemoryLimitMB,
-			ExitCode:      sub.ExitCode,
-			Stdout:        sub.Stdout,
-			Stderr:        sub.Stderr,
-			TimeTakenMs:   sub.TimeTakenMs,
-			MemoryUsedKB:  sub.MemoryUsedKB,
-			TestResults:   sub.TestResults,
-			Error:         sub.Error,
-			CreatedAt:     sub.CreatedAt,
-			CompletedAt:   sub.CompletedAt,
-		}, nil
-	})
+	if s.caches == nil || s.caches.Detail == nil {
+		return load()
+	}
+
+	cacheKey := cache.Key("dashboard", "submissions", userID.String(), "detail", submissionID.String())
+	return s.caches.Detail.Fetch(ctx, cacheKey, 1*time.Hour, load)
+}
+
+func (s *SubmissionsService) loadPaginatedFromDB(ctx context.Context, userID uuid.UUID, query SubmissionListQuery, limit, offset int) (*PaginatedSubmissions, error) {
+	subs, total, err := s.repo.List(ctx, userID, query.Status, query.Language, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	return &PaginatedSubmissions{
+		Items: mapSubmissionSummaries(subs),
+		Total: total,
+	}, nil
+}
+
+func normalizePagination(page, limit int) (int, int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	return page, limit, (page - 1) * limit
+}
+
+func mapSubmissionSummaries(subs []models.Submission) []SubmissionSummaryResponse {
+	results := make([]SubmissionSummaryResponse, len(subs))
+	for i, sub := range subs {
+		results[i] = SubmissionSummaryResponse{
+			ID:              sub.ID,
+			Language:        sub.Language,
+			Status:          sub.Status,
+			ExitCode:        sub.ExitCode,
+			TimeTakenMs:     sub.TimeTakenMs,
+			MemoryUsedKB:    sub.MemoryUsedKB,
+			TotalTestCases:  len(sub.TestResults),
+			PassedTestCases: countPassedTestCases(sub.TestResults),
+			CreatedAt:       sub.CreatedAt,
+			CompletedAt:     sub.CompletedAt,
+		}
+	}
+	return results
+}
+
+func countPassedTestCases(results models.JSONBTestResults) int {
+	passed := 0
+	for _, tc := range results {
+		if tc.Passed {
+			passed++
+		}
+	}
+	return passed
+}
+
+func mapSubmissionDetail(sub *models.Submission) *SubmissionDetailResponse {
+	return &SubmissionDetailResponse{
+		ID:            sub.ID,
+		UserID:        sub.UserID,
+		APIKeyID:      sub.APIKeyID,
+		Language:      sub.Language,
+		Code:          sub.Code,
+		Status:        sub.Status,
+		TimeLimitMs:   sub.TimeLimitMs,
+		MemoryLimitMB: sub.MemoryLimitMB,
+		ExitCode:      sub.ExitCode,
+		Stdout:        sub.Stdout,
+		Stderr:        sub.Stderr,
+		Error:         sub.Error,
+		TimeTakenMs:   sub.TimeTakenMs,
+		MemoryUsedKB:  sub.MemoryUsedKB,
+		TestResults:   sub.TestResults,
+		CreatedAt:     sub.CreatedAt,
+		StartedAt:     sub.StartedAt,
+		CompletedAt:   sub.CompletedAt,
+	}
 }

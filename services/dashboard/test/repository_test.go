@@ -3,29 +3,29 @@ package test
 import (
 	"testing"
 
-	"code-runner/dashboard/internal/repository/apikey"
-	"code-runner/dashboard/internal/repository/submission"
-	"code-runner/dashboard/internal/repository/user"
+	"code-runner/dashboard/internal/auth"
+	"code-runner/dashboard/internal/keys"
+	"code-runner/dashboard/internal/submissions"
 )
 
 func TestRepositories_Instantiation(t *testing.T) {
-	uRepo := user.NewRepository(nil)
-	if uRepo == nil {
-		t.Fatal("expected user repository instance")
+	aRepo := auth.NewAuthRepository(nil)
+	if aRepo == nil {
+		t.Fatal("expected auth repository instance")
 	}
 
-	kRepo := apikey.NewRepository(nil)
+	kRepo := keys.NewKeysRepository(nil)
 	if kRepo == nil {
-		t.Fatal("expected apikey repository instance")
+		t.Fatal("expected keys repository instance")
 	}
 
-	sRepo := submission.NewRepository(nil)
+	sRepo := submissions.NewSubmissionsRepository(nil)
 	if sRepo == nil {
-		t.Fatal("expected submission repository instance")
+		t.Fatal("expected submissions repository instance")
 	}
 
 	// Verify they satisfy their respective interfaces
-	var _ user.Repository = uRepo
-	var _ apikey.Repository = kRepo
-	var _ submission.Repository = sRepo
+	var _ auth.IAuthRepository = aRepo
+	var _ keys.IKeysRepository = kRepo
+	var _ submissions.ISubmissionsRepository = sRepo
 }

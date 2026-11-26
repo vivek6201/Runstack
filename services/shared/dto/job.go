@@ -38,11 +38,11 @@ type TestResult struct {
 }
 
 type SubmitRequest struct {
-	Language      string     `json:"language"`             // "python", "javascript", "cpp"
-	Code          string     `json:"code"`                 // Raw code
-	TestCases     []TestCase `json:"test_cases,omitempty"` // Test cases
-	TimeLimitMs   int64      `json:"time_limit_ms"`        // Timeout (e.g. 2000)
-	MemoryLimitMB int64      `json:"memory_limit_mb"`      // RAM limit (e.g. 128)
+	Language      string     `json:"language" validate:"required"` // "python", "javascript", "cpp"
+	Code          string     `json:"code" validate:"required"`     // Raw code
+	TestCases     []TestCase `json:"test_cases,omitempty"`         // Test cases
+	TimeLimitMs   int64      `json:"time_limit_ms"`                // Timeout (e.g. 2000)
+	MemoryLimitMB int64      `json:"memory_limit_mb"`              // RAM limit (e.g. 128)
 }
 
 type SubmitResponse struct {

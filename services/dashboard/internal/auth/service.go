@@ -3,45 +3,46 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/mail"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"code-runner/shared/dto"
+	"code-runner/dashboard/internal/config"
 	"code-runner/shared/models"
-	userRepo "code-runner/dashboard/internal/repository/user"
 )
 
-var (
-	ErrUserAlreadyExists  = errors.New("user with this email already exists")
-	ErrInvalidCredentials = errors.New("invalid email or password")
-	ErrUserNotFound       = errors.New("user not found")
-)
-
-type Service struct {
-	userRepo  userRepo.Repository
-	jwtSecret string
-	tokenTTL  time.Duration
+type IAuthService interface {
+	Register(ctx context.Context, req RegisterRequest) (*AuthResponse, error)
+	Login(ctx context.Context, req LoginRequest) (*AuthResponse, error)
+	GetUser(ctx context.Context, userID uuid.UUID) (*UserResponse, error)
 }
 
-func NewService(userRepo userRepo.Repository, jwtSecret string, tokenTTL time.Duration) *Service {
-	return &Service{
-		userRepo:  userRepo,
-		jwtSecret: jwtSecret,
-		tokenTTL:  tokenTTL,
+type AuthService struct {
+	repo IAuthRepository
+	cfg  *config.ConfigVar
+}
+
+func NewAuthService(repo IAuthRepository, cfg *config.ConfigVar) IAuthService {
+	return &AuthService{
+		repo: repo,
+		cfg:  cfg,
 	}
 }
 
-func (s *Service) Register(req dto.RegisterRequest) (*dto.AuthResponse, error) {
+func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
-	if email == "" || len(req.Password) < 6 {
-		return nil, errors.New("valid email and password (minimum 6 characters) required")
+	if err := validateEmail(email); err != nil {
+		return nil, err
+	}
+	if err := validatePassword(req.Password); err != nil {
+		return nil, err
 	}
 
-	ctx := context.Background()
-	if _, err := s.userRepo.FindByEmail(ctx, email); err == nil {
+	if _, err := s.repo.FindByEmail(ctx, email); err == nil {
 		return nil, ErrUserAlreadyExists
 	}
 
@@ -58,35 +59,28 @@ func (s *Service) Register(req dto.RegisterRequest) (*dto.AuthResponse, error) {
 		Plan:         models.PlanFree,
 	}
 
-	if err := s.userRepo.Create(ctx, &user); err != nil {
+	if err := s.repo.Create(ctx, &user); err != nil {
 		return nil, err
 	}
 
-	token, expiresAt, err := GenerateToken(&user, s.jwtSecret, s.tokenTTL)
+	token, expiresAt, err := GenerateToken(&user, s.cfg.JWTSecret, s.cfg.TokenTTL)
 	if err != nil {
 		return nil, err
 	}
 
-	return &dto.AuthResponse{
-		User: dto.UserResponse{
-			ID:        user.ID,
-			Email:     user.Email,
-			Role:      user.Role,
-			Plan:      user.Plan,
-			CreatedAt: user.CreatedAt,
-		},
+	return &AuthResponse{
+		User:      toUserResponse(&user),
 		Token:     token,
 		ExpiresAt: expiresAt,
 	}, nil
 }
 
-func (s *Service) Login(req dto.LoginRequest) (*dto.AuthResponse, error) {
+func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthResponse, error) {
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
-	ctx := context.Background()
-	user, err := s.userRepo.FindByEmail(ctx, email)
+	user, err := s.repo.FindByEmail(ctx, email)
 	if err != nil {
-		if errors.Is(err, userRepo.ErrUserNotFound) {
+		if errors.Is(err, ErrUserNotFound) {
 			return nil, ErrInvalidCredentials
 		}
 		return nil, err
@@ -96,39 +90,71 @@ func (s *Service) Login(req dto.LoginRequest) (*dto.AuthResponse, error) {
 		return nil, ErrInvalidCredentials
 	}
 
-	token, expiresAt, err := GenerateToken(user, s.jwtSecret, s.tokenTTL)
+	token, expiresAt, err := GenerateToken(user, s.cfg.JWTSecret, s.cfg.TokenTTL)
 	if err != nil {
 		return nil, err
 	}
 
-	return &dto.AuthResponse{
-		User: dto.UserResponse{
-			ID:        user.ID,
-			Email:     user.Email,
-			Role:      user.Role,
-			Plan:      user.Plan,
-			CreatedAt: user.CreatedAt,
-		},
+	return &AuthResponse{
+		User:      toUserResponse(user),
 		Token:     token,
 		ExpiresAt: expiresAt,
 	}, nil
 }
 
-func (s *Service) GetUser(userID uuid.UUID) (*dto.UserResponse, error) {
-	ctx := context.Background()
-	user, err := s.userRepo.FindByID(ctx, userID)
+func (s *AuthService) GetUser(ctx context.Context, userID uuid.UUID) (*UserResponse, error) {
+	user, err := s.repo.FindByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, userRepo.ErrUserNotFound) {
-			return nil, ErrUserNotFound
-		}
 		return nil, err
 	}
+	resp := toUserResponse(user)
+	return &resp, nil
+}
 
-	return &dto.UserResponse{
+func toUserResponse(user *models.User) UserResponse {
+	return UserResponse{
 		ID:        user.ID,
 		Email:     user.Email,
 		Role:      user.Role,
 		Plan:      user.Plan,
 		CreatedAt: user.CreatedAt,
-	}, nil
+	}
 }
+
+func validateEmail(email string) error {
+	if email == "" || len(email) > 254 {
+		return errors.New("valid email address is required")
+	}
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email || !strings.Contains(email, ".") {
+		return errors.New("valid email address is required")
+	}
+	return nil
+}
+
+func validatePassword(password string) error {
+	if strings.TrimSpace(password) == "" {
+		return errors.New("password cannot be blank or whitespace only")
+	}
+	if len(password) < 8 {
+		return errors.New("password must be at least 8 characters long")
+	}
+	if len([]byte(password)) > 72 {
+		return errors.New("password must not exceed 72 bytes")
+	}
+	var hasLetter, hasDigit bool
+	for _, r := range password {
+		if unicode.IsLetter(r) {
+			hasLetter = true
+		} else if unicode.IsDigit(r) {
+			hasDigit = true
+		}
+	}
+	if !hasLetter || !hasDigit {
+		return errors.New("password must contain at least one letter and one number")
+	}
+	return nil
+}
+
+// Keep unused import guard free
+var _ = time.Second

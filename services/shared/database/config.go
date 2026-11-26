@@ -2,9 +2,11 @@ package database
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"code-runner/shared/env"
+	"code-runner/shared/logger"
 )
 
 // Config holds all database connection parameters and pool settings.
@@ -20,6 +22,7 @@ type Config struct {
 // NewConfigFromEnv parses database settings from environment variables.
 // It prioritizes DATABASE_URL if present, otherwise constructs a DSN from discrete variables.
 func NewConfigFromEnv() *Config {
+	appEnv := strings.ToLower(env.Get("APP_ENV", "development"))
 	dsn := env.Get("DATABASE_URL", "")
 	if dsn == "" {
 		host := env.Get("DB_HOST", "localhost")
@@ -27,11 +30,21 @@ func NewConfigFromEnv() *Config {
 		user := env.Get("DB_USER", "postgres")
 		pass := env.Get("DB_PASSWORD", "postgres")
 		name := env.Get("DB_NAME", "coderunner")
-		ssl := env.Get("DB_SSLMODE", "disable")
+
+		defaultSSL := "disable"
+		if appEnv == "production" {
+			defaultSSL = "require"
+		}
+		ssl := env.Get("DB_SSLMODE", defaultSSL)
+		if appEnv == "production" && ssl == "disable" {
+			logger.Info("SECURITY WARNING: DB_SSLMODE=disable is unsafe in production environments")
+		}
 
 		dsn = fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
 			user, pass, host, port, name, ssl,
 		)
+	} else if appEnv == "production" && strings.Contains(strings.ToLower(dsn), "sslmode=disable") {
+		logger.Info("SECURITY WARNING: DATABASE_URL uses sslmode=disable in production environments")
 	}
 
 	return &Config{

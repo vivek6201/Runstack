@@ -2,66 +2,41 @@ package keys
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
-	apiKeyRepo "code-runner/dashboard/internal/repository/apikey"
 	"code-runner/shared/cache"
 	"code-runner/shared/crypto"
-	"code-runner/shared/dto"
 	"code-runner/shared/models"
 )
 
-var (
-	ErrKeyNotFound = errors.New("api key not found or already revoked")
-)
-
-type Service struct {
-	keyRepo apiKeyRepo.Repository
-	cache   *cache.Cache
+type IKeysService interface {
+	CreateKey(ctx context.Context, userID uuid.UUID, plan models.PlanTier, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error)
+	ListKeys(ctx context.Context, userID uuid.UUID) ([]APIKeyItemResponse, error)
+	RevokeKey(ctx context.Context, userID, keyID uuid.UUID) error
 }
 
-func NewService(keyRepo apiKeyRepo.Repository, cache *cache.Cache) *Service {
-	return &Service{
-		keyRepo: keyRepo,
-		cache:   cache,
+type KeysService struct {
+	repo   IKeysRepository
+	caches *Caches
+}
+
+func NewKeysService(repo IKeysRepository, caches *Caches) IKeysService {
+	return &KeysService{
+		repo:   repo,
+		caches: caches,
 	}
 }
 
-func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.PlanTier, req dto.CreateAPIKeyRequest) (*dto.CreateAPIKeyResponse, error) {
+func (s *KeysService) CreateKey(ctx context.Context, userID uuid.UUID, plan models.PlanTier, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
 	name := req.Name
 	if name == "" {
 		name = "Default API Key"
 	}
 
-	// 1. Determine default & maximum allowances by plan tier to prevent privilege escalation
-	var defaultRPM, maxRPM int
-	var defaultConcurrency, maxConcurrency int
-
-	switch plan {
-	case models.PlanEnterprise:
-		defaultRPM, maxRPM = 1200, 2400
-		defaultConcurrency, maxConcurrency = 50, 100
-	case models.PlanPro:
-		defaultRPM, maxRPM = 300, 600
-		defaultConcurrency, maxConcurrency = 10, 20
-	default: // Free
-		defaultRPM, maxRPM = 60, 60
-		defaultConcurrency, maxConcurrency = 2, 2
-	}
-
-	rpm := req.RateLimitRPM
-	if rpm <= 0 || rpm > maxRPM {
-		rpm = defaultRPM
-	}
-
-	concurrency := req.MaxConcurrency
-	if concurrency <= 0 || concurrency > maxConcurrency {
-		concurrency = defaultConcurrency
-	}
+	rpm, concurrency := resolveKeyQuotas(plan, req.RateLimitRPM, req.MaxConcurrency)
 
 	rawKey, prefix, hash, err := crypto.GenerateAPIKey("live")
 	if err != nil {
@@ -79,27 +54,13 @@ func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.P
 		MaxConcurrency: concurrency,
 	}
 
-	if err := s.keyRepo.Create(ctx, &apiKey); err != nil {
+	if err := s.repo.Create(ctx, &apiKey); err != nil {
 		return nil, fmt.Errorf("failed to save api key: %w", err)
 	}
 
-	// Cache in Redis for sub-millisecond execution engine lookup.
-	// We store without TTL (0) so keys do not expire unexpectedly after 24h.
-	// Key invalidation is explicitly handled via s.cache.Revoke on key revocation.
-	if s.cache != nil {
-		metadata := models.APIKeyCachedMetadata{
-			APIKeyID:       apiKey.ID,
-			UserID:         userID,
-			Plan:           plan,
-			RateLimitRPM:   apiKey.RateLimitRPM,
-			MaxConcurrency: apiKey.MaxConcurrency,
-			IsActive:       true,
-		}
-		_ = s.cache.Set(ctx, cache.Key("apikey", "cache", hash), metadata, 0)
-		_ = s.cache.Revoke(ctx, cache.Key("dashboard", "keys", userID.String()))
-	}
+	s.cacheNewKey(ctx, &apiKey, userID, plan)
 
-	return &dto.CreateAPIKeyResponse{
+	return &CreateAPIKeyResponse{
 		ID:             apiKey.ID,
 		Name:           apiKey.Name,
 		KeyPrefix:      apiKey.KeyPrefix,
@@ -110,56 +71,115 @@ func (s *Service) CreateKey(ctx context.Context, userID uuid.UUID, plan models.P
 	}, nil
 }
 
-// ListKeys wraps the DB lookup with cache.Fetch: checks Redis first, queries DB on miss.
-func (s *Service) ListKeys(ctx context.Context, userID uuid.UUID) ([]dto.APIKeyItemResponse, error) {
-	cacheKey := cache.Key("dashboard", "keys", userID.String())
-
-	return cache.Fetch(ctx, s.cache, cacheKey, 5*time.Minute, func() ([]dto.APIKeyItemResponse, error) {
-		keys, err := s.keyRepo.FindByUserID(ctx, userID)
+func (s *KeysService) ListKeys(ctx context.Context, userID uuid.UUID) ([]APIKeyItemResponse, error) {
+	load := func() (*[]APIKeyItemResponse, error) {
+		list, err := s.repo.FindByUserID(ctx, userID)
 		if err != nil {
 			return nil, err
 		}
+		items := mapKeyItems(list)
+		return &items, nil
+	}
 
-		res := make([]dto.APIKeyItemResponse, len(keys))
-		for i, k := range keys {
-			res[i] = dto.APIKeyItemResponse{
-				ID:             k.ID,
-				Name:           k.Name,
-				KeyPrefix:      k.KeyPrefix,
-				IsActive:       k.IsActive,
-				RateLimitRPM:   k.RateLimitRPM,
-				MaxConcurrency: k.MaxConcurrency,
-				CreatedAt:      k.CreatedAt,
-				RevokedAt:      k.RevokedAt,
-			}
+	if s.caches == nil || s.caches.Keys == nil {
+		res, err := load()
+		if err != nil {
+			return nil, err
 		}
-		return res, nil
-	})
+		return *res, nil
+	}
+
+	cacheKey := cache.Key("dashboard", "keys", userID.String())
+	res, err := s.caches.Keys.Fetch(ctx, cacheKey, 5*time.Minute, load)
+	if err != nil {
+		return nil, err
+	}
+	return *res, nil
 }
 
-func (s *Service) RevokeKey(ctx context.Context, userID, keyID uuid.UUID) error {
-	key, err := s.keyRepo.FindByID(ctx, userID, keyID)
+func (s *KeysService) RevokeKey(ctx context.Context, userID, keyID uuid.UUID) error {
+	key, err := s.repo.FindByID(ctx, userID, keyID)
 	if err != nil {
-		if errors.Is(err, apiKeyRepo.ErrKeyNotFound) {
-			return ErrKeyNotFound
-		}
 		return err
 	}
 
-	if err := s.keyRepo.Revoke(ctx, userID, keyID); err != nil {
-		if errors.Is(err, apiKeyRepo.ErrKeyNotFound) {
-			return ErrKeyNotFound
-		}
+	if err := s.repo.Revoke(ctx, userID, keyID); err != nil {
 		return err
 	}
 
-	// Invalidate API key metadata and keys list cache
-	if s.cache != nil {
-		_ = s.cache.Revoke(ctx,
-			cache.Key("apikey", "cache", key.KeyHash),
-			cache.Key("dashboard", "keys", userID.String()),
-		)
-	}
-
+	s.invalidateRevokedKey(ctx, key.KeyHash, userID)
 	return nil
+}
+
+func (s *KeysService) cacheNewKey(ctx context.Context, apiKey *models.APIKey, userID uuid.UUID, plan models.PlanTier) {
+	if s.caches == nil {
+		return
+	}
+	if s.caches.KeyMetadata != nil {
+		metadata := models.APIKeyCachedMetadata{
+			APIKeyID:       apiKey.ID,
+			UserID:         userID,
+			Plan:           plan,
+			RateLimitRPM:   apiKey.RateLimitRPM,
+			MaxConcurrency: apiKey.MaxConcurrency,
+			IsActive:       true,
+		}
+		_ = s.caches.KeyMetadata.Set(ctx, cache.Key("apikey", "cache", apiKey.KeyHash), &metadata, 0)
+	}
+	if s.caches.Keys != nil {
+		s.caches.Keys.InvalidateAsync(cache.Key("dashboard", "keys", userID.String()))
+	}
+}
+
+func (s *KeysService) invalidateRevokedKey(ctx context.Context, keyHash string, userID uuid.UUID) {
+	if s.caches == nil {
+		return
+	}
+	if s.caches.KeyMetadata != nil {
+		_ = s.caches.KeyMetadata.Delete(ctx, cache.Key("apikey", "cache", keyHash))
+	}
+	if s.caches.Keys != nil {
+		s.caches.Keys.InvalidateAsync(cache.Key("dashboard", "keys", userID.String()))
+	}
+}
+
+func resolveKeyQuotas(plan models.PlanTier, reqRPM, reqConcurrency int) (int, int) {
+	defaultRPM, maxRPM, defaultConc, maxConc := planLimits(plan)
+	rpm := reqRPM
+	if rpm <= 0 || rpm > maxRPM {
+		rpm = defaultRPM
+	}
+	concurrency := reqConcurrency
+	if concurrency <= 0 || concurrency > maxConc {
+		concurrency = defaultConc
+	}
+	return rpm, concurrency
+}
+
+func mapKeyItems(list []models.APIKey) []APIKeyItemResponse {
+	res := make([]APIKeyItemResponse, len(list))
+	for i, k := range list {
+		res[i] = APIKeyItemResponse{
+			ID:             k.ID,
+			Name:           k.Name,
+			KeyPrefix:      k.KeyPrefix,
+			IsActive:       k.IsActive,
+			RateLimitRPM:   k.RateLimitRPM,
+			MaxConcurrency: k.MaxConcurrency,
+			CreatedAt:      k.CreatedAt,
+			RevokedAt:      k.RevokedAt,
+		}
+	}
+	return res
+}
+
+func planLimits(plan models.PlanTier) (defaultRPM, maxRPM, defaultConc, maxConc int) {
+	switch plan {
+	case models.PlanEnterprise:
+		return 1200, 2400, 50, 100
+	case models.PlanPro:
+		return 300, 600, 10, 20
+	default:
+		return 60, 60, 2, 2
+	}
 }

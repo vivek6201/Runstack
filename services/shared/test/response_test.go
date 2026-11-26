@@ -6,14 +6,14 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 
 	"code-runner/shared/response"
 )
 
 func TestResponse_Success(t *testing.T) {
 	app := fiber.New()
-	app.Get("/test", func(c *fiber.Ctx) error {
+	app.Get("/test", func(c fiber.Ctx) error {
 		return response.Success(c, fiber.Map{"message": "ok"})
 	})
 
@@ -48,7 +48,7 @@ func TestResponse_Success(t *testing.T) {
 
 func TestResponse_Error(t *testing.T) {
 	app := fiber.New()
-	app.Get("/error", func(c *fiber.Ctx) error {
+	app.Get("/error", func(c fiber.Ctx) error {
 		return response.NotFound(c, "resource not found")
 	})
 
@@ -82,7 +82,7 @@ func TestResponse_FiberErrorHandler(t *testing.T) {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: response.FiberErrorHandler,
 	})
-	app.Get("/panic", func(c *fiber.Ctx) error {
+	app.Get("/panic", func(c fiber.Ctx) error {
 		return errors.New("something went wrong")
 	})
 
