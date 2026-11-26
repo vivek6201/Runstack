@@ -1,30 +1,53 @@
 # ==============================================================================
-# Dockerfile: Dashboard API Service (Fiber + GORM + PostgreSQL + Redis)
+# Dockerfile: Dashboard API Service (Fiber v3 + GORM + Atlas + Postgres + Redis)
 # ==============================================================================
 
-FROM golang:1.24-alpine AS builder
+# Development Stage (live reload via Air)
+FROM golang:1.26-alpine AS dev
 
 WORKDIR /app
-
-# Disable go.work in container build to use relative replace directives in go.mod
 ENV GOWORK=off
 ENV GOTOOLCHAIN=auto
 
-# Copy shared data contracts and dashboard code
+RUN apk add --no-cache git build-base && \
+    go install github.com/air-verse/air@latest
+
+COPY services/shared ./services/shared
+COPY services/dashboard ./services/dashboard
+
+WORKDIR /app/services/dashboard
+RUN go mod download
+
+EXPOSE 8080
+CMD ["air", "-c", ".air.toml"]
+
+# Production Builder Stage
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+ENV GOWORK=off
+ENV GOTOOLCHAIN=auto
+
 COPY services/shared ./services/shared
 COPY services/dashboard ./services/dashboard
 
 WORKDIR /app/services/dashboard
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/dashboard ./cmd/server
 
-# Runtime Stage
-FROM alpine:3.20
+# Production Runtime Stage (default)
+FROM alpine:3.20 AS prod
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata curl bash && \
+    curl -sSf --proto '=https' --tlsv1.2 https://atlasgo.sh | sh -s -- --yes && \
+    addgroup -g 1000 -S runner && \
+    adduser -u 1000 -S runner -G runner
 
 WORKDIR /app
-COPY --from=builder /app/bin/dashboard .
+COPY --from=builder --chown=runner:runner /app/bin/dashboard .
+COPY --chown=runner:runner migrations ./migrations
+
+USER runner
 
 EXPOSE 8080
 
-CMD ["./dashboard"]
+CMD ["sh", "-c", "atlas migrate apply --url \"${DATABASE_URL:-postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@${DB_HOST:-postgres}:${DB_PORT:-5432}/${DB_NAME:-coderunner}?sslmode=${DB_SSLMODE:-disable}}\" --dir \"file://migrations\" --allow-dirty && ./dashboard"]

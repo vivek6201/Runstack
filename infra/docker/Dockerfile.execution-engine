@@ -3,7 +3,28 @@
 # Contains: Go binary + 7 Language Compilers/Runtimes for Linux Execution
 # ==============================================================================
 
-FROM golang:1.24-alpine AS builder
+# Development Stage (live reload via Air)
+FROM golang:1.26-alpine AS dev
+
+WORKDIR /app
+ENV GOWORK=off
+ENV GOTOOLCHAIN=auto
+
+RUN apk add --no-cache \
+    git build-base gcc g++ musl-dev python3 nodejs openjdk17-jdk go curl bash ca-certificates && \
+    go install github.com/air-verse/air@latest
+
+COPY services/shared ./services/shared
+COPY services/execution-engine ./services/execution-engine
+
+WORKDIR /app/services/execution-engine
+RUN go mod download
+
+EXPOSE 8081
+CMD ["air", "-c", ".air.toml"]
+
+# Production Builder Stage
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 ENV GOWORK=off
@@ -15,8 +36,8 @@ COPY services/execution-engine ./services/execution-engine
 WORKDIR /app/services/execution-engine
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/execution-engine ./cmd/server
 
-# Runtime Stage: equipped with all 7 compilers and runtimes
-FROM alpine:3.20
+# Production Runtime Stage (default)
+FROM alpine:3.20 AS prod
 
 # 1. Install standard compilers and runtimes
 RUN apk add --no-cache \
@@ -32,13 +53,18 @@ RUN apk add --no-cache \
     bash \
     ca-certificates
 
-# 2. Install standalone Bun for fast TypeScript execution
-RUN curl -fsSL https://bun.sh/install | bash && \
+# 2. Install standalone Bun for fast TypeScript execution & create unprivileged runner user
+RUN curl -fsSL --proto '=https' --tlsv1.2 https://bun.sh/install | bash && \
     mv /root/.bun/bin/bun /usr/local/bin/bun && \
-    chmod +x /usr/local/bin/bun
+    chmod 0755 /usr/local/bin/bun && \
+    rm -rf /root/.bun && \
+    addgroup -g 1000 -S runner && \
+    adduser -u 1000 -S runner -G runner
 
 WORKDIR /app
-COPY --from=builder /app/bin/execution-engine .
+COPY --from=builder --chown=runner:runner /app/bin/execution-engine .
+
+USER runner
 
 EXPOSE 8081
 

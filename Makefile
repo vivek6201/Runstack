@@ -149,9 +149,24 @@ db-shell: ## Open interactive PostgreSQL shell inside container
 redis-shell: ## Open interactive Redis CLI inside container
 	docker exec -it coderunner-redis redis-cli
 
-.PHONY: db-migrate
-db-migrate: ## Run Atlas database migration
+.PHONY: db-migrate migration-gen migration-apply migration-status migration-hash
+db-migrate: migration-apply ## Alias for migration-apply
+
+migration-gen: ## Generate a new Atlas SQL migration (usage: make migration-gen name=add_feature)
+	@if [ -z "$(name)" ]; then \
+		echo "Error: 'name' variable is required. Example: make migration-gen name=init"; \
+		exit 1; \
+	fi
+	atlas migrate diff $(name) --env local
+
+migration-apply: ## Apply pending Atlas migrations to database
 	atlas migrate apply --env local
+
+migration-status: ## Check Atlas migration status
+	atlas migrate status --env local
+
+migration-hash: ## Recompute migrations/atlas.sum integrity hash
+	atlas migrate hash --dir file://migrations
 
 .PHONY: clean
 clean: ## Remove temporary build binaries and socket artifacts

@@ -50,7 +50,8 @@ services:
       - /dev/kvm:/dev/kvm
     volumes:
       - ../build/firecracker:/opt/firecracker
-    privileged: true
+    # Note: Do not run with `privileged: true`; only /dev/kvm device access is needed.
+    # If host /dev/kvm requires a specific GID on Linux, pass `group_add: ["<kvm-gid>"]`.
     ports:
       - "${ENGINE_PORT:-8081}:8081"
     depends_on:
