@@ -55,11 +55,35 @@ export interface Job {
   completed_at?: string
 }
 
+export interface UserProfile {
+  id: string
+  username: string
+  display_name: string
+  bio: string
+  avatar_url: string
+  default_language: Language | string
+  editor_theme: string
+  company: string
+  github_url: string
+}
+
+export interface SessionInfo {
+  provider: string
+  ip_address: string
+  user_agent: string
+  device_name: string
+  expires_at: string
+  last_rotated_at: string
+  last_active_at: string
+  created_at: string
+}
+
 export interface User {
   id: string
   email: string
   role: "admin" | "member"
   plan: "free" | "pro" | "enterprise"
+  profile?: UserProfile
   created_at: string
 }
 

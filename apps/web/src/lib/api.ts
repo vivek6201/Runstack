@@ -3,10 +3,12 @@ import type {
   CreatedApiKeyResponse,
   DashboardStats,
   Job,
+  SessionInfo,
   SubmissionDetail,
   SubmissionSummary,
   TestCase,
   User,
+  UserProfile,
 } from "../types"
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api"
@@ -74,6 +76,22 @@ export const api = {
 
   async getMe(): Promise<User> {
     return request<User>("/auth/me")
+  },
+
+  async getActiveSession(): Promise<SessionInfo> {
+    return request<SessionInfo>("/auth/session")
+  },
+
+  // Profile
+  async getProfile(): Promise<UserProfile> {
+    return request<UserProfile>("/profile")
+  },
+
+  async updateProfile(payload: Partial<Omit<UserProfile, "id">>): Promise<UserProfile> {
+    return request<UserProfile>("/profile", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    })
   },
 
   // API Keys
